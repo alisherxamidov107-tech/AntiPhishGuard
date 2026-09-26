@@ -915,9 +915,30 @@ def main():
     print("===================================")
     print("")
 
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES
-    )
+    # Render Free Web Service uchun webhook.
+    # Lokal kompyuterda esa odatdagi polling ishlaydi.
+    render_url = os.getenv("RENDER_EXTERNAL_URL")
+
+    if render_url:
+        port = int(os.getenv("PORT", "10000"))
+        webhook_url = f"{render_url.rstrip('/')}/telegram"
+
+        print(f"🌐 Webhook: {webhook_url}")
+        print(f"🔌 Port: {port}")
+
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path="telegram",
+            webhook_url=webhook_url,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+    else:
+        print("💻 Lokal rejim: polling")
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES
+        )
 
 
 if __name__ == "__main__":
