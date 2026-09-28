@@ -1,6 +1,11 @@
 import os
 import sqlite3
 import logging
+import asyncio
+import socket
+import urllib.request
+import json
+from urllib.parse import urlparse
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -10,7 +15,9 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+
 from telegram.constants import ChatMemberStatus
+
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -279,6 +286,7 @@ async def start(
         "• 🔗 Havolalarni tekshirish\n"
         "• 🚨 Phishingni aniqlash\n"
         "• 🗑️ Xavfli xabarlarni o‘chirish\n"
+        "• 📦 APK fayllarni bloklash\n"
         "• 📊 Hodisalar statistikasi\n"
         "• ⚙️ Guruh himoyasini boshqarish\n\n"
 
@@ -320,7 +328,10 @@ async def menu_callback(
 
             "🚨 Shubhali havola aniqlansa, "
             "xabar o‘chiriladi va guruhga "
-            "ogohlantirish yuboriladi."
+            "ogohlantirish yuboriladi.\n\n"
+
+            "📦 APK fayllar ham avtomatik "
+            "bloklanadi."
         )
 
         keyboard = InlineKeyboardMarkup([
@@ -345,6 +356,7 @@ async def menu_callback(
 
             "🔗 URL scanning — ON\n"
             "🚨 Phishing detection — ON\n"
+            "📦 APK protection — ON\n"
             "🗑️ Xavfli xabarlarni o‘chirish — ON\n"
             "📊 Incident logging — ON\n\n"
 
@@ -489,6 +501,7 @@ async def protect(
         "🛡️ <b>APG himoyasi yoqildi!</b>\n\n"
         "🔗 Havolalar tekshiriladi.\n"
         "🚨 Shubhali linklar aniqlanadi.\n"
+        "📦 APK fayllar bloklanadi.\n"
         "🗑️ Xavfli xabarlar o‘chiriladi.",
         parse_mode="HTML"
     )
@@ -586,6 +599,80 @@ async def stats(
 
 
 # =========================================================
+# LINK IP / LOCATION LOOKUP
+# =========================================================
+
+def get_link_info(url: str):
+    """
+    Domenning DNS orqali server IP manzilini aniqlaydi.
+    IP geolocation server IP bo'yicha taxminiy davlat/shahar/ISP beradi.
+    Bu linkni yuborgan odamning IP manzili emas.
+    """
+    try:
+        clean_url = (url or "").rstrip(".,!?;:)")
+
+        if clean_url.startswith("www."):
+            clean_url = "https://" + clean_url
+
+        parsed = urlparse(clean_url)
+        domain = parsed.hostname
+
+        if not domain:
+            return None
+
+        domain = domain.lower()
+        ip = socket.gethostbyname(domain)
+
+        country = "Aniqlanmadi"
+        city = "Aniqlanmadi"
+        isp = "Aniqlanmadi"
+
+        try:
+            api_url = (
+                f"http://ip-api.com/json/{ip}"
+                "?fields=status,country,city,isp,org"
+            )
+
+            request = urllib.request.Request(
+                api_url,
+                headers={"User-Agent": "AntiPhishGuard/1.0"}
+            )
+
+            with urllib.request.urlopen(request, timeout=5) as response:
+                data = json.loads(response.read().decode("utf-8"))
+
+            if data.get("status") == "success":
+                country = data.get("country") or "Aniqlanmadi"
+                city = data.get("city") or "Aniqlanmadi"
+                isp = (
+                    data.get("isp")
+                    or data.get("org")
+                    or "Aniqlanmadi"
+                )
+
+        except Exception as e:
+            logger.warning(
+                "IP geolocation xatosi: %s",
+                e
+            )
+
+        return {
+            "domain": domain,
+            "ip": ip,
+            "country": country,
+            "city": city,
+            "isp": isp,
+        }
+
+    except Exception as e:
+        logger.warning(
+            "Link IP aniqlash xatosi: %s",
+            e
+        )
+        return None
+
+
+# =========================================================
 # MESSAGE SCANNER
 # =========================================================
 
@@ -593,7 +680,6 @@ async def scan_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     message = update.effective_message
 
     if not message:
@@ -604,53 +690,104 @@ async def scan_message(
     if not chat:
         return
 
+    # Faqat guruhlar uchun.
     if chat.type not in [
         "group",
         "supergroup"
     ]:
         return
 
+    # Himoya yoqilmagan bo'lsa.
     if not is_protection_enabled(chat.id):
         return
-    # APK fayllarni avtomatik o‘chirish
-    if message.document:
-        file_name = (message.document.file_name or "").lower()
-        mime_type = (message.document.mime_type or "").lower()
 
-        if (
+    user = update.effective_user
+
+    username = (
+        user.mention_html()
+        if user
+        else "Foydalanuvchi"
+    )
+
+    # =====================================================
+    # APK DETECTION
+    # =====================================================
+
+    if message.document:
+
+        file_name = (
+            message.document.file_name or ""
+        ).lower()
+
+        mime_type = (
+            message.document.mime_type or ""
+        ).lower()
+
+        is_apk = (
             file_name.endswith(".apk")
-            or mime_type == "application/vnd.android.package-archive"
-        ):
+            or mime_type
+            == "application/vnd.android.package-archive"
+        )
+
+        if is_apk:
+
             try:
+                # APK xabarini o'chirish.
                 await message.delete()
 
-                warning = await context.bot.send_message(
+                scanning = await context.bot.send_message(
                     chat_id=chat.id,
                     text=(
-                        "🚫 <b>APK fayl o‘chirildi!</b>\n\n"
-                        "🛡️ Ushbu guruhda APK fayllarni yuborish taqiqlangan.\n"
-                        "🛡️ <b>AntiPhish Guard</b>"
+                        "🔎 <b>SECURITY SCAN</b>\n\n"
+                        "📦 APK fayl tekshirilmoqda...\n"
+                        "⏳ Iltimos kuting..."
                     ),
                     parse_mode="HTML"
                 )
 
-                context.job_queue.run_once(
-                    delete_warning,
-                    10,
-                    data={
-                        "chat_id": chat.id,
-                        "message_id": warning.message_id,
-                    }
+                await asyncio.sleep(0.7)
+
+                await scanning.edit_text(
+                    "🛡️ <b>ANTI-PHISH GUARD</b>\n\n"
+                    "🔍 APK fayl tahlil qilinmoqda...\n"
+                    "⚠️ Xavfsizlik tekshiruvi davom etmoqda...",
+                    parse_mode="HTML"
+                )
+
+                await asyncio.sleep(0.7)
+
+                await scanning.edit_text(
+                    "🚨 <b>THREAT DETECTED</b>\n\n"
+                    "❌ Xavfli APK aniqlandi!\n"
+                    "🛑 Fayl bloklanmoqda...",
+                    parse_mode="HTML"
+                )
+
+                await asyncio.sleep(0.7)
+
+                await scanning.edit_text(
+                    "🚨 <b>DIQQAT! XAVF ANIQLANDI!</b>\n\n"
+                    "📦 <b>APK FAYL BLOKLANDI!</b>\n\n"
+                    f"👤 Foydalanuvchi: {username}\n"
+                    "🔴 Status: <b>BLOKLANDI</b>\n"
+                    "📱 Turi: ANDROID APK\n\n"
+                    "⚠️ Ushbu fayl xavfsizlik "
+                    "sababli guruhdan o'chirildi.\n\n"
+                    "🛡️ <b>AntiPhish Guard</b>",
+                    parse_mode="HTML"
                 )
 
             except Exception as e:
                 logger.warning(
-                    "APK faylni o‘chirishda xato: %s",
+                    "APK faylni qayta ishlashda xato: %s",
                     e
                 )
 
             return
 
+    # =====================================================
+    # TEXT / LINK SCAN
+    # =====================================================
 
     text = (
         message.text
@@ -661,12 +798,44 @@ async def scan_message(
     if not text:
         return
 
+    # services.scanner ichidagi URL aniqlash funksiyasi.
     dangerous_urls = scan_text(text)
 
     if not dangerous_urls:
         return
 
-    user = update.effective_user
+    # =====================================================
+    # LINK IP INFORMATION
+    # =====================================================
+
+    link_info_blocks = []
+
+    for url in dangerous_urls:
+        info = get_link_info(url)
+
+        if info:
+            link_info_blocks.append(
+                "\n".join([
+                    f"🔗 Link: <code>{url}</code>",
+                    f"🌐 Domen: <code>{info['domain']}</code>",
+                    f"📡 Server IP: <code>{info['ip']}</code>",
+                    f"🌍 Davlat: {info['country']}",
+                    f"🏙 Shahar: {info['city']}",
+                    f"🏢 ISP/Hosting: {info['isp']}",
+                ])
+            )
+        else:
+            link_info_blocks.append(
+                "\n".join([
+                    f"🔗 Link: <code>{url}</code>",
+                    "📡 Server IP: Aniqlanmadi",
+                    "🌍 Joylashuv: Aniqlanmadi",
+                ])
+            )
+
+    # =====================================================
+    # INCIDENT LOGGING
+    # =====================================================
 
     for url in dangerous_urls:
 
@@ -674,56 +843,73 @@ async def scan_message(
             chat_id=chat.id,
             user_id=user.id if user else 0,
             username=user.username if user else "",
-            url=url,
+            url=url
         )
 
-    try:
+    # =====================================================
+    # DELETE DANGEROUS MESSAGE
+    # =====================================================
 
+    try:
         await message.delete()
 
     except Exception as e:
-
         logger.warning(
-            "Xabarni o‘chirib bo‘lmadi: %s",
+            "Xabarni o'chirib bo'lmadi: %s",
             e
         )
 
-    username = (
-        user.mention_html()
-        if user
-        else "Foydalanuvchi"
-    )
-
-    warning = (
-        "🚨 <b>PHISHING ANIQLANDI!</b>\n\n"
-        f"👤 {username}\n"
-        "🔗 Shubhali havola aniqlandi.\n"
-        "🗑️ Xabar o‘chirildi.\n\n"
-        "🛡️ <b>AntiPhish Guard</b>"
-    )
+    # =====================================================
+    # PROFESSIONAL PHISHING ANIMATION
+    # =====================================================
 
     try:
-
-        warning_message = (
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text=warning,
-                parse_mode="HTML",
-            )
+        scanning = await context.bot.send_message(
+            chat_id=chat.id,
+            text=(
+                "🔎 <b>SECURITY SCAN</b>\n\n"
+                "🔗 Havola tekshirilmoqda...\n"
+                "⏳ Iltimos kuting..."
+            ),
+            parse_mode="HTML"
         )
 
-        context.job_queue.run_once(
-            delete_warning,
-            15,
-            data={
-                "chat_id": chat.id,
-                "message_id":
-                    warning_message.message_id,
-            }
+        await asyncio.sleep(0.7)
+
+        await scanning.edit_text(
+            "🛡️ <b>ANTI-PHISH GUARD</b>\n\n"
+            "🔍 Havola tahlil qilinmoqda...\n"
+            "🌐 Server ma'lumotlari aniqlanmoqda...",
+            parse_mode="HTML"
+        )
+
+        await asyncio.sleep(0.7)
+
+        await scanning.edit_text(
+            "🚨 <b>THREAT DETECTED</b>\n\n"
+            "❌ Xavfli havola aniqlandi!\n"
+            "🛑 Xabar bloklanmoqda...",
+            parse_mode="HTML"
+        )
+
+        await asyncio.sleep(0.7)
+
+        details = "\n\n".join(link_info_blocks)
+
+        await scanning.edit_text(
+            "🚨 <b>DIQQAT! XAVF ANIQLANDI!</b>\n\n"
+            "🔗 <b>XAVFLI LINK ANIQLANDI!</b>\n\n"
+            f"👤 Foydalanuvchi: {username}\n"
+            "🔴 Status: <b>BLOKLANDI</b>\n"
+            "⚠️ Risk: <b>PHISHING</b>\n\n"
+            f"{details}\n\n"
+            "🚫 <b>BU HAVOLAGA KIRMANG!</b>\n"
+            "Xabar xavfsizlik sababli o'chirildi.\n\n"
+            "🛡️ <b>AntiPhish Guard</b>",
+            parse_mode="HTML"
         )
 
     except Exception as e:
-
         logger.error(
             "Warning yuborishda xato: %s",
             e
@@ -768,7 +954,10 @@ async def bot_added_to_group(
     old_status = member_update.old_chat_member.status
     new_status = member_update.new_chat_member.status
 
-    # Bot guruhga qo‘shilgan holat
+    # =====================================================
+    # BOT GURUHGA QO‘SHILDI
+    # =====================================================
+
     if new_status in [
         ChatMemberStatus.MEMBER,
         ChatMemberStatus.ADMINISTRATOR,
@@ -789,11 +978,15 @@ async def bot_added_to_group(
             text = (
                 "🛡️ <b>AntiPhish Guard</b>\n\n"
 
-                "✅ Bot guruhga muvaffaqiyatli qo‘shildi!\n\n"
+                "✅ Bot guruhga muvaffaqiyatli "
+                "qo‘shildi!\n\n"
 
                 "🔐 Men guruhdagi havolalarni "
                 "tekshiraman va shubhali phishing "
                 "linklarini aniqlashga harakat qilaman.\n\n"
+
+                "📦 APK fayllar avtomatik "
+                "bloklanadi.\n\n"
 
                 "⚠️ <b>Muhim:</b>\n"
                 "Botni <b>ADMIN</b> qiling va "
@@ -822,7 +1015,10 @@ async def bot_added_to_group(
                     e
                 )
 
-    # Bot admin qilingan holat
+    # =====================================================
+    # BOT ADMIN QILINDI
+    # =====================================================
+
     if new_status == ChatMemberStatus.ADMINISTRATOR:
 
         chat = update.effective_chat
@@ -839,7 +1035,9 @@ async def bot_added_to_group(
                 text=(
                     "✅ <b>Rahmat!</b>\n\n"
                     "🛡️ AntiPhish Guard admin huquqiga ega.\n"
-                    "🔐 Himoya ishlashga tayyor."
+                    "🔐 Himoya ishlashga tayyor.\n"
+                    "📦 APK Protection: ON\n"
+                    "🔗 Phishing Protection: ON"
                 ),
                 parse_mode="HTML"
             )
@@ -866,32 +1064,59 @@ def main():
         .build()
     )
 
-    # Commands
+    # =====================================================
+    # COMMANDS
+    # =====================================================
+
     application.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
     application.add_handler(
-        CommandHandler("protect", protect)
+        CommandHandler(
+            "protect",
+            protect
+        )
     )
 
     application.add_handler(
-        CommandHandler("unprotect", unprotect)
+        CommandHandler(
+            "unprotect",
+            unprotect
+        )
     )
 
     application.add_handler(
-        CommandHandler("status", status)
+        CommandHandler(
+            "status",
+            status
+        )
     )
 
     application.add_handler(
-        CommandHandler("stats", stats)
+        CommandHandler(
+            "stats",
+            stats
+        )
     )
 
-    # Inline buttons
+    # =====================================================
+    # INLINE BUTTONS
+    # =====================================================
+
     application.add_handler(
-        CallbackQueryHandler(menu_callback)
+        CallbackQueryHandler(
+            menu_callback
+        )
     )
-    # Bot groupga qo‘shilganda
+
+    # =====================================================
+    # BOT GROUPGA QO‘SHILGANDA
+    # =====================================================
+
     application.add_handler(
         ChatMemberHandler(
             bot_added_to_group,
@@ -899,13 +1124,22 @@ def main():
         )
     )
 
-    # Group messages
+    # =====================================================
+    # GROUP MESSAGE SCANNER
+    # =====================================================
+
     application.add_handler(
         MessageHandler(
-            filters.TEXT | filters.Document.ALL | filters.CaptionRegex(r".+"),
+            filters.TEXT
+            | filters.Document.ALL
+            | filters.CaptionRegex(r".+"),
             scan_message
         )
     )
+
+    # =====================================================
+    # START MESSAGE
+    # =====================================================
 
     print("")
     print("===================================")
@@ -915,16 +1149,34 @@ def main():
     print("===================================")
     print("")
 
-    # Render Free Web Service uchun webhook.
-    # Lokal kompyuterda esa odatdagi polling ishlaydi.
-    render_url = os.getenv("RENDER_EXTERNAL_URL")
+    # =====================================================
+    # RENDER WEBHOOK
+    # =====================================================
+
+    render_url = os.getenv(
+        "RENDER_EXTERNAL_URL"
+    )
 
     if render_url:
-        port = int(os.getenv("PORT", "10000"))
-        webhook_url = f"{render_url.rstrip('/')}/telegram"
 
-        print(f"🌐 Webhook: {webhook_url}")
-        print(f"🔌 Port: {port}")
+        port = int(
+            os.getenv(
+                "PORT",
+                "10000"
+            )
+        )
+
+        webhook_url = (
+            f"{render_url.rstrip('/')}/telegram"
+        )
+
+        print(
+            f"🌐 Webhook: {webhook_url}"
+        )
+
+        print(
+            f"🔌 Port: {port}"
+        )
 
         application.run_webhook(
             listen="0.0.0.0",
@@ -934,12 +1186,21 @@ def main():
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
         )
+
     else:
-        print("💻 Lokal rejim: polling")
+
+        print(
+            "💻 Lokal rejim: polling"
+        )
+
         application.run_polling(
             allowed_updates=Update.ALL_TYPES
         )
 
+
+# =========================================================
+# RUN
+# =========================================================
 
 if __name__ == "__main__":
     main()
