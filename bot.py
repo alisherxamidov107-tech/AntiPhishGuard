@@ -301,6 +301,7 @@ async def start(
         "• 📦 APK fayllarni bloklash\n"
         "• 📊 Hodisalar statistikasi\n"
         "• ⚙️ Guruh himoyasini boshqarish\n\n"
+         "• 🔗 Havolalarni botga yuboring va link haqida malumotlarga ega boling\n\n"
 
         "👇 Kerakli bo‘limni tanlang:"
     )
