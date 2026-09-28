@@ -28,7 +28,7 @@ from telegram.ext import (
     filters,
 )
 
-from services.scanner import scan_text
+from services.scanner import scan_text, extract_urls
 
 
 # =========================================================
@@ -628,25 +628,22 @@ def get_link_info(url: str):
         isp = "Aniqlanmadi"
 
         try:
-            api_url = (
-                f"http://ip-api.com/json/{ip}"
-                "?fields=status,country,city,isp,org"
-            )
+            api_url = f"https://ipwho.is/{ip}"
 
             request = urllib.request.Request(
                 api_url,
                 headers={"User-Agent": "AntiPhishGuard/1.0"}
             )
 
-            with urllib.request.urlopen(request, timeout=5) as response:
+            with urllib.request.urlopen(request, timeout=8) as response:
                 data = json.loads(response.read().decode("utf-8"))
 
-            if data.get("status") == "success":
+            if data.get("success") is True:
                 country = data.get("country") or "Aniqlanmadi"
                 city = data.get("city") or "Aniqlanmadi"
                 isp = (
-                    data.get("isp")
-                    or data.get("org")
+                    data.get("connection", {}).get("isp")
+                    or data.get("connection", {}).get("org")
                     or "Aniqlanmadi"
                 )
 
@@ -690,7 +687,62 @@ async def scan_message(
     if not chat:
         return
 
-    # Faqat guruhlar uchun.
+    # =====================================================
+    # PRIVATE CHAT LINK LOOKUP
+    # =====================================================
+    # Botga shaxsiy chatda link yuborilsa, linkning server
+    # IP va IP-geolocation ma'lumotini qaytaradi.
+    if chat.type == "private":
+
+        text = (
+            message.text
+            or message.caption
+            or ""
+        )
+
+        urls = extract_urls(text)
+
+        if not urls:
+            return
+
+        results = []
+
+        for url in urls:
+            info = get_link_info(url)
+
+            if info:
+                results.append(
+                    "\n".join([
+                        "🔎 <b>LINK TAHLILI</b>",
+                        "",
+                        f"🔗 Link: <code>{url}</code>",
+                        f"🌐 Domen: <code>{info['domain']}</code>",
+                        f"📡 Server IP: <code>{info['ip']}</code>",
+                        f"🌍 Davlat: {info['country']}",
+                        f"🏙 Taxminiy shahar: {info['city']}",
+                        f"🏢 ISP/Hosting: {info['isp']}",
+                        "",
+                        "ℹ️ <i>Joylashuv IP bo‘yicha taxminiy.</i>",
+                    ])
+                )
+            else:
+                results.append(
+                    "\n".join([
+                        "🔎 <b>LINK TAHLILI</b>",
+                        "",
+                        f"🔗 Link: <code>{url}</code>",
+                        "❌ Server IP ma'lumotini aniqlab bo‘lmadi.",
+                    ])
+                )
+
+        await message.reply_text(
+            "\n\n".join(results),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return
+
+    # Faqat guruhlarda.
     if chat.type not in [
         "group",
         "supergroup"
