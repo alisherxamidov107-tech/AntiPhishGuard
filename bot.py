@@ -604,14 +604,16 @@ async def stats(
 
 def get_link_info(url: str):
     """
-    Domenning DNS orqali server IP manzilini aniqlaydi.
-    IP geolocation server IP bo'yicha taxminiy davlat/shahar/ISP beradi.
-    Bu linkni yuborgan odamning IP manzili emas.
+    Domen uchun mavjud IPv4/IPv6 manzillarni aniqlaydi.
+    www.example.com va example.com bir domen sifatida ko'rib chiqiladi.
     """
     try:
         clean_url = (url or "").rstrip(".,!?;:)")
 
         if clean_url.startswith("www."):
+            clean_url = "https://" + clean_url
+
+        elif not clean_url.startswith(("http://", "https://")):
             clean_url = "https://" + clean_url
 
         parsed = urlparse(clean_url)
@@ -621,44 +623,113 @@ def get_link_info(url: str):
             return None
 
         domain = domain.lower()
-        ip = socket.gethostbyname(domain)
 
-        country = "Aniqlanmadi"
-        city = "Aniqlanmadi"
-        isp = "Aniqlanmadi"
+        # www.example.com -> example.com
+        if domain.startswith("www."):
+            domain = domain[4:]
+
+        # Barcha IPv4/IPv6 manzillarni olish.
+        addresses = []
 
         try:
-            api_url = f"https://ipwho.is/{ip}"
-
-            request = urllib.request.Request(
-                api_url,
-                headers={"User-Agent": "AntiPhishGuard/1.0"}
+            results = socket.getaddrinfo(
+                domain,
+                443,
+                type=socket.SOCK_STREAM
             )
 
-            with urllib.request.urlopen(request, timeout=8) as response:
-                data = json.loads(response.read().decode("utf-8"))
+            for result in results:
+                sockaddr = result[4]
 
-            if data.get("success") is True:
-                country = data.get("country") or "Aniqlanmadi"
-                city = data.get("city") or "Aniqlanmadi"
-                isp = (
-                    data.get("connection", {}).get("isp")
-                    or data.get("connection", {}).get("org")
-                    or "Aniqlanmadi"
-                )
+                if sockaddr:
+                    ip = sockaddr[0]
+
+                    if ip not in addresses:
+                        addresses.append(ip)
 
         except Exception as e:
             logger.warning(
-                "IP geolocation xatosi: %s",
+                "DNS/IP aniqlash xatosi: %s",
                 e
             )
 
+        # Fallback: oddiy IPv4.
+        if not addresses:
+            try:
+                ip = socket.gethostbyname(domain)
+                addresses.append(ip)
+            except Exception:
+                pass
+
+        if not addresses:
+            return None
+
+        # Har bir IP uchun geolocation.
+        ip_details = []
+
+        for ip in addresses:
+            country = "Aniqlanmadi"
+            city = "Aniqlanmadi"
+            isp = "Aniqlanmadi"
+
+            try:
+                api_url = f"https://ipwho.is/{ip}"
+
+                request = urllib.request.Request(
+                    api_url,
+                    headers={
+                        "User-Agent": "AntiPhishGuard/1.0"
+                    }
+                )
+
+                with urllib.request.urlopen(
+                    request,
+                    timeout=8
+                ) as response:
+
+                    data = json.loads(
+                        response.read().decode("utf-8")
+                    )
+
+                if data.get("success") is True:
+                    country = (
+                        data.get("country")
+                        or "Aniqlanmadi"
+                    )
+
+                    city = (
+                        data.get("city")
+                        or "Aniqlanmadi"
+                    )
+
+                    connection = data.get(
+                        "connection",
+                        {}
+                    )
+
+                    isp = (
+                        connection.get("isp")
+                        or connection.get("org")
+                        or "Aniqlanmadi"
+                    )
+
+            except Exception as e:
+                logger.warning(
+                    "IP geolocation xatosi (%s): %s",
+                    ip,
+                    e
+                )
+
+            ip_details.append({
+                "ip": ip,
+                "country": country,
+                "city": city,
+                "isp": isp,
+            })
+
         return {
             "domain": domain,
-            "ip": ip,
-            "country": country,
-            "city": city,
-            "isp": isp,
+            "ips": ip_details,
         }
 
     except Exception as e:
@@ -705,38 +776,103 @@ async def scan_message(
         if not urls:
             return
 
-        results = []
+        # Bir nechta URL bo'lsa hammasini tahlil qilamiz.
+        # Bir xil domenning http/https/www variantlari bitta domen
+        # sifatida birlashtiriladi.
+        grouped = {}
 
         for url in urls:
-            info = get_link_info(url)
+            clean_url = url.rstrip(".,!?;:)")
 
-            if info:
-                results.append(
-                    "\n".join([
-                        "🔎 <b>LINK TAHLILI</b>",
-                        "",
-                        f"🔗 Link: <code>{url}</code>",
-                        f"🌐 Domen: <code>{info['domain']}</code>",
-                        f"📡 Server IP: <code>{info['ip']}</code>",
-                        f"🌍 Davlat: {info['country']}",
-                        f"🏙 Taxminiy shahar: {info['city']}",
-                        f"🏢 ISP/Hosting: {info['isp']}",
-                        "",
-                        "ℹ️ <i>Joylashuv IP bo‘yicha taxminiy.</i>",
-                    ])
+            normalized = clean_url
+
+            if normalized.startswith("www."):
+                normalized = "https://" + normalized
+
+            elif not normalized.startswith(
+                ("http://", "https://")
+            ):
+                normalized = "https://" + normalized
+
+            parsed = urlparse(normalized)
+            domain = parsed.hostname
+
+            if not domain:
+                continue
+
+            domain = domain.lower()
+
+            if domain.startswith("www."):
+                domain = domain[4:]
+
+            if domain not in grouped:
+                grouped[domain] = []
+
+            if clean_url not in grouped[domain]:
+                grouped[domain].append(clean_url)
+
+        results = []
+
+        for domain, domain_urls in grouped.items():
+
+            # Domen bo'yicha bir marta DNS/IP tekshiramiz.
+            info = get_link_info(
+                f"https://{domain}"
+            )
+
+            lines = [
+                "🔎 <b>LINK TAHLILI</b>",
+                "",
+                "🔗 <b>Topilgan linklar:</b>",
+            ]
+
+            for link in domain_urls:
+                lines.append(
+                    f"• <code>{link}</code>"
                 )
+
+            lines.extend([
+                "",
+                f"🌐 Domen: <code>{domain}</code>",
+            ])
+
+            if info and info.get("ips"):
+                lines.append(
+                    f"📡 <b>Server IP'lar: "
+                    f"{len(info['ips'])} ta</b>"
+                )
+
+                for number, item in enumerate(
+                    info["ips"],
+                    start=1
+                ):
+                    lines.extend([
+                        "",
+                        f"<b>IP #{number}</b>",
+                        f"📡 IP: <code>{item['ip']}</code>",
+                        f"🌍 Davlat: {item['country']}",
+                        f"🏙 Shahar: {item['city']}",
+                        f"🏢 ISP/Hosting: {item['isp']}",
+                    ])
+
             else:
-                results.append(
-                    "\n".join([
-                        "🔎 <b>LINK TAHLILI</b>",
-                        "",
-                        f"🔗 Link: <code>{url}</code>",
-                        "❌ Server IP ma'lumotini aniqlab bo‘lmadi.",
-                    ])
-                )
+                lines.extend([
+                    "",
+                    "❌ Server IP ma'lumotini aniqlab bo'lmadi.",
+                ])
+
+            lines.extend([
+                "",
+                "ℹ️ <i>IP geolokatsiya ma'lumoti.</i>",
+            ])
+
+            results.append("\n".join(lines))
+
+        if not results:
+            return
 
         await message.reply_text(
-            "\n\n".join(results),
+            "\n\n━━━━━━━━━━━━━━\n\n".join(results),
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
