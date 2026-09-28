@@ -4,9 +4,12 @@ import logging
 import asyncio
 import socket
 import urllib.request
+import urllib.parse
 import json
 from urllib.parse import urlparse
-from datetime import datetime
+from datetime import datetime, time as dt_time
+from zoneinfo import ZoneInfo
+import re
 
 from dotenv import load_dotenv
 
@@ -27,6 +30,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
 )
+
 
 from services.scanner import scan_text, extract_urls
 
@@ -90,6 +94,14 @@ def init_db():
             username TEXT,
             url TEXT,
             created_at TEXT
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS daily_video_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_video_id TEXT,
+            updated_at TEXT
         )
     """)
 
@@ -289,7 +301,6 @@ async def start(
         "• 📦 APK fayllarni bloklash\n"
         "• 📊 Hodisalar statistikasi\n"
         "• ⚙️ Guruh himoyasini boshqarish\n\n"
-         "• 🔗 Havolalarni botga tashlang va link haqidagi malumotlarga eha boling\n\n"
 
         "👇 Kerakli bo‘limni tanlang:"
     )
@@ -605,16 +616,14 @@ async def stats(
 
 def get_link_info(url: str):
     """
-    Domen uchun mavjud IPv4/IPv6 manzillarni aniqlaydi.
-    www.example.com va example.com bir domen sifatida ko'rib chiqiladi.
+    Domenning DNS orqali server IP manzilini aniqlaydi.
+    IP geolocation server IP bo'yicha taxminiy davlat/shahar/ISP beradi.
+    Bu linkni yuborgan odamning IP manzili emas.
     """
     try:
         clean_url = (url or "").rstrip(".,!?;:)")
 
         if clean_url.startswith("www."):
-            clean_url = "https://" + clean_url
-
-        elif not clean_url.startswith(("http://", "https://")):
             clean_url = "https://" + clean_url
 
         parsed = urlparse(clean_url)
@@ -624,113 +633,44 @@ def get_link_info(url: str):
             return None
 
         domain = domain.lower()
+        ip = socket.gethostbyname(domain)
 
-        # www.example.com -> example.com
-        if domain.startswith("www."):
-            domain = domain[4:]
-
-        # Barcha IPv4/IPv6 manzillarni olish.
-        addresses = []
+        country = "Aniqlanmadi"
+        city = "Aniqlanmadi"
+        isp = "Aniqlanmadi"
 
         try:
-            results = socket.getaddrinfo(
-                domain,
-                443,
-                type=socket.SOCK_STREAM
+            api_url = f"https://ipwho.is/{ip}"
+
+            request = urllib.request.Request(
+                api_url,
+                headers={"User-Agent": "AntiPhishGuard/1.0"}
             )
 
-            for result in results:
-                sockaddr = result[4]
+            with urllib.request.urlopen(request, timeout=8) as response:
+                data = json.loads(response.read().decode("utf-8"))
 
-                if sockaddr:
-                    ip = sockaddr[0]
-
-                    if ip not in addresses:
-                        addresses.append(ip)
+            if data.get("success") is True:
+                country = data.get("country") or "Aniqlanmadi"
+                city = data.get("city") or "Aniqlanmadi"
+                isp = (
+                    data.get("connection", {}).get("isp")
+                    or data.get("connection", {}).get("org")
+                    or "Aniqlanmadi"
+                )
 
         except Exception as e:
             logger.warning(
-                "DNS/IP aniqlash xatosi: %s",
+                "IP geolocation xatosi: %s",
                 e
             )
 
-        # Fallback: oddiy IPv4.
-        if not addresses:
-            try:
-                ip = socket.gethostbyname(domain)
-                addresses.append(ip)
-            except Exception:
-                pass
-
-        if not addresses:
-            return None
-
-        # Har bir IP uchun geolocation.
-        ip_details = []
-
-        for ip in addresses:
-            country = "Aniqlanmadi"
-            city = "Aniqlanmadi"
-            isp = "Aniqlanmadi"
-
-            try:
-                api_url = f"https://ipwho.is/{ip}"
-
-                request = urllib.request.Request(
-                    api_url,
-                    headers={
-                        "User-Agent": "AntiPhishGuard/1.0"
-                    }
-                )
-
-                with urllib.request.urlopen(
-                    request,
-                    timeout=8
-                ) as response:
-
-                    data = json.loads(
-                        response.read().decode("utf-8")
-                    )
-
-                if data.get("success") is True:
-                    country = (
-                        data.get("country")
-                        or "Aniqlanmadi"
-                    )
-
-                    city = (
-                        data.get("city")
-                        or "Aniqlanmadi"
-                    )
-
-                    connection = data.get(
-                        "connection",
-                        {}
-                    )
-
-                    isp = (
-                        connection.get("isp")
-                        or connection.get("org")
-                        or "Aniqlanmadi"
-                    )
-
-            except Exception as e:
-                logger.warning(
-                    "IP geolocation xatosi (%s): %s",
-                    ip,
-                    e
-                )
-
-            ip_details.append({
-                "ip": ip,
-                "country": country,
-                "city": city,
-                "isp": isp,
-            })
-
         return {
             "domain": domain,
-            "ips": ip_details,
+            "ip": ip,
+            "country": country,
+            "city": city,
+            "isp": isp,
         }
 
     except Exception as e:
@@ -777,103 +717,38 @@ async def scan_message(
         if not urls:
             return
 
-        # Bir nechta URL bo'lsa hammasini tahlil qilamiz.
-        # Bir xil domenning http/https/www variantlari bitta domen
-        # sifatida birlashtiriladi.
-        grouped = {}
-
-        for url in urls:
-            clean_url = url.rstrip(".,!?;:)")
-
-            normalized = clean_url
-
-            if normalized.startswith("www."):
-                normalized = "https://" + normalized
-
-            elif not normalized.startswith(
-                ("http://", "https://")
-            ):
-                normalized = "https://" + normalized
-
-            parsed = urlparse(normalized)
-            domain = parsed.hostname
-
-            if not domain:
-                continue
-
-            domain = domain.lower()
-
-            if domain.startswith("www."):
-                domain = domain[4:]
-
-            if domain not in grouped:
-                grouped[domain] = []
-
-            if clean_url not in grouped[domain]:
-                grouped[domain].append(clean_url)
-
         results = []
 
-        for domain, domain_urls in grouped.items():
+        for url in urls:
+            info = get_link_info(url)
 
-            # Domen bo'yicha bir marta DNS/IP tekshiramiz.
-            info = get_link_info(
-                f"https://{domain}"
-            )
-
-            lines = [
-                "🔎 <b>LINK TAHLILI</b>",
-                "",
-                "🔗 <b>Topilgan linklar:</b>",
-            ]
-
-            for link in domain_urls:
-                lines.append(
-                    f"• <code>{link}</code>"
-                )
-
-            lines.extend([
-                "",
-                f"🌐 Domen: <code>{domain}</code>",
-            ])
-
-            if info and info.get("ips"):
-                lines.append(
-                    f"📡 <b>Server IP'lar: "
-                    f"{len(info['ips'])} ta</b>"
-                )
-
-                for number, item in enumerate(
-                    info["ips"],
-                    start=1
-                ):
-                    lines.extend([
+            if info:
+                results.append(
+                    "\n".join([
+                        "🔎 <b>LINK TAHLILI</b>",
                         "",
-                        f"<b>IP #{number}</b>",
-                        f"📡 IP: <code>{item['ip']}</code>",
-                        f"🌍 Davlat: {item['country']}",
-                        f"🏙 Shahar: {item['city']}",
-                        f"🏢 ISP/Hosting: {item['isp']}",
+                        f"🔗 Link: <code>{url}</code>",
+                        f"🌐 Domen: <code>{info['domain']}</code>",
+                        f"📡 Server IP: <code>{info['ip']}</code>",
+                        f"🌍 Davlat: {info['country']}",
+                        f"🏙 Taxminiy shahar: {info['city']}",
+                        f"🏢 ISP/Hosting: {info['isp']}",
+                        "",
+                        "ℹ️ <i>Joylashuv IP bo‘yicha taxminiy.</i>",
                     ])
-
+                )
             else:
-                lines.extend([
-                    "",
-                    "❌ Server IP ma'lumotini aniqlab bo'lmadi.",
-                ])
-
-            lines.extend([
-                "",
-                "ℹ️ <i>IP geolokatsiya ma'lumoti.</i>",
-            ])
-
-            results.append("\n".join(lines))
-
-        if not results:
-            return
+                results.append(
+                    "\n".join([
+                        "🔎 <b>LINK TAHLILI</b>",
+                        "",
+                        f"🔗 Link: <code>{url}</code>",
+                        "❌ Server IP ma'lumotini aniqlab bo‘lmadi.",
+                    ])
+                )
 
         await message.reply_text(
-            "\n\n━━━━━━━━━━━━━━\n\n".join(results),
+            "\n\n".join(results),
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
@@ -1106,6 +981,299 @@ async def scan_message(
 
 
 # =========================================================
+# DAILY UZBEK CYBERSECURITY VIDEO
+# =========================================================
+
+DAILY_VIDEO_CHAT_ID = os.getenv("DAILY_VIDEO_CHAT_ID")
+DAILY_VIDEO_HOUR = int(os.getenv("DAILY_VIDEO_HOUR", "12"))
+DAILY_VIDEO_MINUTE = int(os.getenv("DAILY_VIDEO_MINUTE", "0"))
+DAILY_VIDEO_TZ = os.getenv("DAILY_VIDEO_TZ", "Asia/Tashkent")
+
+VIDEO_SEARCH_QUERIES = [
+    'Kiberxavfsizlik markazi kiberxavfsizlik',
+    'Kiberxavfsizlik markazi firibgarlik',
+    'Kiberxavfsizlik markazi himoya',
+    'ICHKI ISHLAR VAZIRLIGI kiberxavfsizlik',
+]
+
+UZBEK_CYBER_WORDS = [
+    'kiber', 'xavfsizlik', 'firibgarlik', 'himoya', 'parol',
+    'shaxsiy', "ma'lumot", 'ma’lumot', 'zararli', 'virus',
+    'phishing', 'apk', 'ogoh', 'firibgar', 'akkaunt', 'internet',
+]
+
+TRUSTED_VIDEO_CHANNEL_HINTS = [
+    'Kiberxavfsizlik markazi',
+    'ICHKI ISHLAR VAZIRLIGI',
+    'csecuz',
+    'ichkiishlarvazirligi',
+]
+
+
+def _html_unescape(text: str) -> str:
+    import html
+    return html.unescape(text or "")
+
+
+def find_uzbek_cyber_videos(limit: int = 5):
+    """
+    YouTube public search sahifasidan kiberxavfsizlikka oid
+    o'zbekcha videolarni topishga harakat qiladi.
+
+    Bot video faylni yuklab olmaydi: faqat video havolasini yuboradi.
+    Bu usul API key talab qilmaydi.
+    """
+
+    found = []
+    seen = set()
+
+    for query in VIDEO_SEARCH_QUERIES:
+        try:
+            encoded_query = urllib.parse.quote_plus(query)
+            search_url = (
+                "https://www.youtube.com/results?search_query="
+                + encoded_query
+            )
+
+            request = urllib.request.Request(
+                search_url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 Chrome/142 Safari/537.36"
+                    )
+                },
+            )
+
+            with urllib.request.urlopen(request, timeout=15) as response:
+                page = response.read().decode("utf-8", errors="ignore")
+
+            # YouTube sahifasidagi videoId qiymatlarini ajratib olamiz.
+            ids = re.findall(r'"videoId":"([A-Za-z0-9_-]{11})"', page)
+
+            for video_id in ids:
+                if video_id in seen:
+                    continue
+
+                # ID oldidan/atrofidan title topishga harakat qilamiz.
+                pos = page.find('"videoId":"' + video_id + '"')
+                chunk = page[max(0, pos - 2500):pos + 5000]
+
+                title_match = re.search(
+                    r'"title":\{"runs":\[\{"text":"(.*?)"',
+                    chunk,
+                    re.S,
+                )
+
+                owner_match = re.search(
+                    r'"ownerText":\{"runs":\[\{"text":"(.*?)"',
+                    chunk,
+                    re.S,
+                )
+
+                title = (
+                    _html_unescape(title_match.group(1))
+                    if title_match
+                    else "Kiberxavfsizlik videosi"
+                )
+
+                owner = (
+                    _html_unescape(owner_match.group(1))
+                    if owner_match
+                    else ""
+                )
+
+                title_lower = title.lower()
+                owner_lower = owner.lower()
+
+                # Faqat kiberxavfsizlik mavzusiga yaqin videolar.
+                if not any(word in title_lower for word in UZBEK_CYBER_WORDS):
+                    continue
+
+                # O'zbekcha mazmun belgilaridan kamida bittasi bo'lsin.
+                uzbek_markers = [
+                    "o'zbek", "o‘zbek", "uzbek", "xavfsizlik",
+                    "firibgarlik", "himoya", "parol", "ma'lumot",
+                    "ma’lumot", "zararli", "ogoh", "firibgar",
+                ]
+
+                if not any(marker in title_lower for marker in uzbek_markers):
+                    continue
+
+                # Faqat ishonchli rasmiy manbalardan olingan videolar.
+                if not any(
+                    hint.lower() in owner_lower
+                    for hint in TRUSTED_VIDEO_CHANNEL_HINTS
+                ):
+                    continue
+
+                seen.add(video_id)
+                found.append({
+                    "id": video_id,
+                    "title": title[:200],
+                    "url": f"https://www.youtube.com/watch?v={video_id}",
+                })
+
+                if len(found) >= limit:
+                    return found
+
+        except Exception as e:
+            logger.warning(
+                "YouTube qidiruv xatosi (%s): %s",
+                query,
+                e,
+            )
+
+    return found
+
+
+def get_last_daily_video_id():
+    conn = db_connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT last_video_id FROM daily_video_state WHERE id = 1"
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def save_last_daily_video_id(video_id: str):
+    conn = db_connect()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO daily_video_state (id, last_video_id, updated_at)
+        VALUES (1, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            last_video_id = excluded.last_video_id,
+            updated_at = excluded.updated_at
+    """, (video_id, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+
+async def send_daily_cyber_video(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Har kuni bir marta ro'yxatdan o'tgan guruhlarga
+    o'zbekcha kiberxavfsizlik videosi havolasini yuboradi.
+    """
+
+    videos = await asyncio.to_thread(find_uzbek_cyber_videos, 5)
+
+    if not videos:
+        logger.warning("O'zbekcha kiberxavfsizlik videosi topilmadi.")
+        return
+
+    last_video_id = get_last_daily_video_id()
+    video = next(
+        (item for item in videos if item["id"] != last_video_id),
+        videos[0],
+    )
+
+    conn = db_connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT chat_id FROM groups WHERE enabled = 1")
+    chat_ids = [row[0] for row in cursor.fetchall()]
+    conn.close()
+
+    # Agar Renderda maxsus kanal/guruh ko'rsatilgan bo'lsa,
+    # video o'sha chatga ham yuboriladi.
+    if DAILY_VIDEO_CHAT_ID:
+        try:
+            chat_id = int(DAILY_VIDEO_CHAT_ID)
+            if chat_id not in chat_ids:
+                chat_ids.append(chat_id)
+        except ValueError:
+            logger.warning("DAILY_VIDEO_CHAT_ID noto'g'ri: %s", DAILY_VIDEO_CHAT_ID)
+
+    text = (
+        "🇺🇿 <b>KUNNING KIBERXAVFSIZLIK VIDEOSI</b>\n\n"
+        f"🎥 <b>{video['title']}</b>\n\n"
+        "🛡️ Faqat o'zbekcha kiberxavfsizlik mavzusidagi\n"
+        "foydali va himoyalanishga oid video.\n\n"
+        f"▶️ <a href=\"{video['url']}\">Videoni ko'rish</a>\n\n"
+        "🛡️ <b>AntiPhish Guard</b>"
+    )
+
+    sent_any = False
+
+    for chat_id in chat_ids:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=False,
+            )
+            sent_any = True
+        except Exception as e:
+            logger.warning(
+                "Kunlik video %s chatga yuborilmadi: %s",
+                chat_id,
+                e,
+            )
+
+    if sent_any:
+        save_last_daily_video_id(video["id"])
+
+
+async def daily_video_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Darhol test uchun bitta o'zbekcha kiberxavfsizlik videosini yuboradi."""
+    if not update.effective_chat:
+        return
+
+    videos = await asyncio.to_thread(find_uzbek_cyber_videos, 5)
+
+    if not videos:
+        await update.effective_message.reply_text(
+            "❌ Hozircha ishonchli o'zbekcha kiberxavfsizlik videosi topilmadi."
+        )
+        return
+
+    video = videos[0]
+    await update.effective_message.reply_text(
+        "🇺🇿 <b>Kiberxavfsizlik videosi</b>\n\n"
+        f"🎥 <b>{video['title']}</b>\n\n"
+        f"▶️ <a href=\"{video['url']}\">Videoni ko'rish</a>",
+        parse_mode="HTML",
+        disable_web_page_preview=False,
+    )
+
+
+def setup_daily_video_job(application: Application):
+    """Kunlik video jobini ishga tushiradi."""
+
+    if application.job_queue is None:
+        logger.warning(
+            "JobQueue mavjud emas. "
+            "python-telegram-bot[job-queue] paketini o'rnating."
+        )
+        return
+
+    try:
+        tz = ZoneInfo(DAILY_VIDEO_TZ)
+    except Exception:
+        tz = ZoneInfo("Asia/Tashkent")
+
+    application.job_queue.run_daily(
+        send_daily_cyber_video,
+        time=dt_time(
+            hour=DAILY_VIDEO_HOUR,
+            minute=DAILY_VIDEO_MINUTE,
+            tzinfo=tz,
+        ),
+        name="daily_uzbek_cyber_video",
+    )
+
+    logger.info(
+        "Kunlik o'zbekcha kiberxavfsizlik video jobi: %02d:%02d (%s)",
+        DAILY_VIDEO_HOUR,
+        DAILY_VIDEO_MINUTE,
+        DAILY_VIDEO_TZ,
+    )
+
+
+# =========================================================
 # DELETE WARNING
 # =========================================================
 
@@ -1292,6 +1460,13 @@ def main():
         )
     )
 
+    application.add_handler(
+        CommandHandler(
+            "video",
+            daily_video_command
+        )
+    )
+
     # =====================================================
     # INLINE BUTTONS
     # =====================================================
@@ -1325,6 +1500,12 @@ def main():
             scan_message
         )
     )
+
+    # =====================================================
+    # DAILY UZBEK CYBERSECURITY VIDEO
+    # =====================================================
+
+    setup_daily_video_job(application)
 
     # =====================================================
     # START MESSAGE
