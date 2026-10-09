@@ -27,6 +27,7 @@ from telegram.ext import (
     ContextTypes,
     ChatMemberHandler,
     CallbackQueryHandler,
+    BusinessConnectionHandler,
     filters,
 )
 
@@ -298,6 +299,111 @@ EXTRA = {
 }
 
 
+BIZ_TEXTS = {
+    "uz": {
+        "biz_connected": (
+            "✅ <b>AntiPhish Guard Business chatlaringizga ulandi.</b>\n\n"
+            "Boshqalardan kelgan APK fayllar va phishing havolali xabarlar "
+            "shaxsiy chatlaringizda avtomatik o‘chiriladi.\n\n"
+            "🔒 Ogohlantirishlar faqat shu yerda sizga yuboriladi, "
+            "suhbatdoshlaringiz hech narsa ko‘rmaydi."
+        ),
+        "biz_no_delete": (
+            "⚠️ Botda xabarlarni o‘chirish ruxsati yo‘q.\n"
+            "Settings → Business → Chatbots bo‘limida xabarlarni "
+            "boshqarish (o‘chirish) ruxsatini yoqing."
+        ),
+        "biz_disconnected": "🔕 Business ulanish o‘chirildi.",
+        "biz_apk": (
+            "🚨 <b>Business chat: APK bloklandi</b>\n\n"
+            "👤 Yuboruvchi: {sender}\n"
+            "💬 Chat: {chat}\n"
+            "📦 Android APK fayl yuborilgan edi."
+        ),
+        "biz_phish": (
+            "🚨 <b>Business chat: phishing havola bloklandi</b>\n\n"
+            "👤 Yuboruvchi: {sender}\n"
+            "💬 Chat: {chat}\n\n"
+            "{details}\n\n"
+            "🚫 Bu havolaga kirmang!"
+        ),
+        "biz_deleted": "🗑️ Xabar o‘chirildi.",
+        "biz_not_deleted": (
+            "⚠️ Xabarni o‘chirib bo‘lmadi. Botga Business sozlamalarida "
+            "xabarlarni o‘chirish ruxsatini bering."
+        ),
+    },
+    "ru": {
+        "biz_connected": (
+            "✅ <b>AntiPhish Guard подключён к вашим Business-чатам.</b>\n\n"
+            "APK файлы и сообщения с фишинговыми ссылками от других "
+            "людей будут автоматически удаляться в ваших личных чатах.\n\n"
+            "🔒 Предупреждения приходят только вам сюда, собеседники "
+            "ничего не увидят."
+        ),
+        "biz_no_delete": (
+            "⚠️ У бота нет права удалять сообщения.\n"
+            "Включите право управления сообщениями в "
+            "Settings → Business → Chatbots."
+        ),
+        "biz_disconnected": "🔕 Business-подключение отключено.",
+        "biz_apk": (
+            "🚨 <b>Business-чат: APK заблокирован</b>\n\n"
+            "👤 Отправитель: {sender}\n"
+            "💬 Чат: {chat}\n"
+            "📦 Был отправлен Android APK файл."
+        ),
+        "biz_phish": (
+            "🚨 <b>Business-чат: фишинговая ссылка заблокирована</b>\n\n"
+            "👤 Отправитель: {sender}\n"
+            "💬 Чат: {chat}\n\n"
+            "{details}\n\n"
+            "🚫 Не переходите по этой ссылке!"
+        ),
+        "biz_deleted": "🗑️ Сообщение удалено.",
+        "biz_not_deleted": (
+            "⚠️ Не удалось удалить сообщение. Дайте боту право удалять "
+            "сообщения в настройках Business."
+        ),
+    },
+    "en": {
+        "biz_connected": (
+            "✅ <b>AntiPhish Guard is connected to your Business chats.</b>\n\n"
+            "APK files and phishing links sent to you by others will be "
+            "deleted automatically in your private chats.\n\n"
+            "🔒 Alerts are sent only to you here; the people you chat "
+            "with see nothing."
+        ),
+        "biz_no_delete": (
+            "⚠️ The bot has no permission to delete messages.\n"
+            "Enable message management in Settings → Business → Chatbots."
+        ),
+        "biz_disconnected": "🔕 Business connection removed.",
+        "biz_apk": (
+            "🚨 <b>Business chat: APK blocked</b>\n\n"
+            "👤 Sender: {sender}\n"
+            "💬 Chat: {chat}\n"
+            "📦 An Android APK file was sent."
+        ),
+        "biz_phish": (
+            "🚨 <b>Business chat: phishing link blocked</b>\n\n"
+            "👤 Sender: {sender}\n"
+            "💬 Chat: {chat}\n\n"
+            "{details}\n\n"
+            "🚫 Do not open this link!"
+        ),
+        "biz_deleted": "🗑️ Message deleted.",
+        "biz_not_deleted": (
+            "⚠️ Could not delete the message. Grant the bot permission to "
+            "delete messages in Business settings."
+        ),
+    },
+}
+
+for _lang, _texts in BIZ_TEXTS.items():
+    EXTRA[_lang].update(_texts)
+
+
 def t(lang: str, key: str, **kwargs) -> str:
     """Avval EXTRA, topilmasa i18n.tr dan matn oladi."""
     table = EXTRA.get(lang, EXTRA["uz"])
@@ -357,8 +463,72 @@ def init_db():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS business_connections (
+            connection_id TEXT PRIMARY KEY,
+            user_id INTEGER,
+            user_chat_id INTEGER,
+            is_enabled INTEGER DEFAULT 1,
+            can_delete INTEGER DEFAULT 1,
+            created_at TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
+
+
+def save_business_connection(bc):
+    """Telegram BusinessConnection obyektini bazaga saqlaydi."""
+    rights = getattr(bc, "rights", None)
+    can_delete = (
+        bool(getattr(rights, "can_delete_all_messages", False))
+        if rights is not None
+        else True  # eski versiyalarda huquq ma'lum emas
+    )
+
+    conn = db_connect()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO business_connections
+        (connection_id, user_id, user_chat_id, is_enabled, can_delete, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(connection_id) DO UPDATE SET
+            user_id = excluded.user_id,
+            user_chat_id = excluded.user_chat_id,
+            is_enabled = excluded.is_enabled,
+            can_delete = excluded.can_delete
+    """, (
+        bc.id,
+        bc.user.id,
+        bc.user_chat_id,
+        1 if bc.is_enabled else 0,
+        1 if can_delete else 0,
+        datetime.now().isoformat(),
+    ))
+    conn.commit()
+    conn.close()
+
+
+def get_business_connection(connection_id: str):
+    conn = db_connect()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT user_id, user_chat_id, is_enabled, can_delete
+        FROM business_connections WHERE connection_id = ?
+    """, (connection_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    return {
+        "user_id": row[0],
+        "user_chat_id": row[1],
+        "is_enabled": bool(row[2]),
+        "can_delete": bool(row[3]),
+    }
 
 
 def register_group(chat_id: int, title: str):
@@ -800,6 +970,10 @@ async def scan_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message or not chat:
         return
 
+    # Business xabarlar alohida handlerda qayta ishlanadi.
+    if getattr(message, "business_connection_id", None):
+        return
+
     is_private = chat.type == "private"
     is_group = chat.type in ("group", "supergroup")
 
@@ -926,6 +1100,160 @@ async def scan_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.error("Warning yuborishda xato: %s", e)
+
+
+# =========================================================
+# BUSINESS CHATLAR (Telegram Premium: Settings -> Business -> Chatbots)
+# =========================================================
+
+async def delete_business_message(context, connection_id: str, message_id: int):
+    bot = context.bot
+
+    if hasattr(bot, "delete_business_messages"):
+        return await bot.delete_business_messages(
+            business_connection_id=connection_id,
+            message_ids=[message_id],
+        )
+
+    return await bot.do_api_request(
+        "deleteBusinessMessages",
+        api_kwargs={
+            "business_connection_id": connection_id,
+            "message_ids": [message_id],
+        },
+    )
+
+
+async def get_business_conn(context, connection_id: str):
+    conn = get_business_connection(connection_id)
+
+    if conn:
+        return conn
+
+    # Baza tozalangan bo'lsa, Telegram'dan qayta so'raymiz.
+    try:
+        bc = await context.bot.get_business_connection(connection_id)
+        save_business_connection(bc)
+        return get_business_connection(connection_id)
+    except Exception as e:
+        logger.warning("Business ulanishni olib bo'lmadi: %s", e)
+        return None
+
+
+async def business_connection_update(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    bc = update.business_connection
+
+    if not bc:
+        return
+
+    save_business_connection(bc)
+
+    lang = get_language("user", bc.user.id)
+
+    if not bc.is_enabled:
+        text = t(lang, "biz_disconnected")
+    else:
+        conn = get_business_connection(bc.id)
+        text = t(lang, "biz_connected")
+
+        if conn and not conn["can_delete"]:
+            text += "\n\n" + t(lang, "biz_no_delete")
+
+    try:
+        await context.bot.send_message(
+            chat_id=bc.user_chat_id,
+            text=text,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.warning("Business ulanish xabarini yuborib bo'lmadi: %s", e)
+
+
+async def scan_business_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    message = update.business_message or update.edited_business_message
+
+    if not message or not message.business_connection_id:
+        return
+
+    connection_id = message.business_connection_id
+    conn = await get_business_conn(context, connection_id)
+
+    if not conn or not conn["is_enabled"]:
+        return
+
+    owner_id = conn["user_id"]
+    owner_chat_id = conn["user_chat_id"]
+    sender = message.from_user
+
+    # Faqat boshqalardan kelgan xabarlar tekshiriladi.
+    if sender and sender.id == owner_id:
+        return
+
+    lang = get_language("user", owner_id)
+
+    is_apk = is_apk_document(message.document)
+    dangerous_urls = []
+
+    if not is_apk:
+        text = message.text or message.caption or ""
+        if not text:
+            return
+
+        dangerous_urls = scan_text(text)
+        if not dangerous_urls:
+            return  # Xavfsiz xabar: tegmaymiz.
+
+    # Xabarni o'chirish.
+    deleted = False
+    try:
+        await delete_business_message(context, connection_id, message.message_id)
+        deleted = True
+    except Exception as e:
+        logger.warning("Business xabarni o'chirib bo'lmadi: %s", e)
+
+    # Hodisani saqlash.
+    sender_id = sender.id if sender else 0
+    sender_username = sender.username if sender and sender.username else ""
+
+    for url in (dangerous_urls or ["APK"]):
+        save_incident(owner_chat_id, sender_id, sender_username, url)
+
+    # Ogohlantirish faqat egasiga (bot bilan chatga) yuboriladi.
+    sender_name = html.escape(sender.full_name) if sender else "?"
+    if sender and sender.username:
+        sender_name += f" (@{html.escape(sender.username)})"
+
+    chat_name = html.escape(message.chat.full_name or str(message.chat.id))
+
+    if is_apk:
+        notice = t(lang, "biz_apk", sender=sender_name, chat=chat_name)
+    else:
+        blocks = [await build_link_block(u, lang) for u in dangerous_urls]
+        notice = t(
+            lang,
+            "biz_phish",
+            sender=sender_name,
+            chat=chat_name,
+            details="\n\n".join(blocks),
+        )
+
+    notice += "\n\n" + t(lang, "biz_deleted" if deleted else "biz_not_deleted")
+
+    try:
+        await context.bot.send_message(
+            chat_id=owner_chat_id,
+            text=notice,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.warning("Egasiga ogohlantirish yuborilmadi: %s", e)
 
 
 # =========================================================
@@ -1288,11 +1616,25 @@ def main():
         )
     )
 
-    # Xabarlarni tekshirish (guruh + shaxsiy chat)
+    # Business ulanish (Premium: Settings -> Business -> Chatbots)
+    application.add_handler(
+        BusinessConnectionHandler(business_connection_update)
+    )
+
+    # Business chatlardagi xabarlar (OLDIN turishi shart)
+    application.add_handler(
+        MessageHandler(
+            filters.UpdateType.BUSINESS_MESSAGES,
+            scan_business_message,
+        )
+    )
+
+    # Xabarlarni tekshirish (guruh + botga yozilgan shaxsiy chat)
     application.add_handler(
         MessageHandler(
             (filters.TEXT | filters.Document.ALL | filters.CaptionRegex(r".+"))
-            & ~filters.COMMAND,
+            & ~filters.COMMAND
+            & ~filters.UpdateType.BUSINESS_MESSAGES,
             scan_message,
         )
     )
