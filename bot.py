@@ -56,7 +56,7 @@ if not BOT_TOKEN:
 
 # Faqat loyiha egasi foydalana oladigan Admin Panel
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-ADMIN_PASSWORD = "MySecurePass2026"  # Admin panel paroli shu yerda saqlanadi
+ADMIN_PASSWORD = "alisher09022"  # Admin panel paroli shu yerda saqlanadi
 
 
 # =========================================================
