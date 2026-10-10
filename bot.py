@@ -54,6 +54,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN topilmadi. .env faylini tekshiring.")
 
+# Faqat loyiha egasi foydalana oladigan Admin Panel
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
 
 # =========================================================
 # LOGGING
@@ -1576,6 +1579,197 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
+# OWNER-ONLY ADMIN PANEL (mavjud funksiyalarga tegilmagan)
+# =========================================================
+
+
+def is_bot_owner(update: Update) -> bool:
+    """Admin panel faqat .env dagi ADMIN_ID egasiga ochiladi."""
+    user = update.effective_user
+    return bool(user and ADMIN_ID > 0 and user.id == ADMIN_ID)
+
+
+def owner_admin_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Umumiy statistika", callback_data="admin:stats")],
+        [InlineKeyboardButton("👥 Guruhlarni boshqarish", callback_data="admin:groups:0")],
+        [InlineKeyboardButton("🚨 Oxirgi tahdidlar", callback_data="admin:incidents")],
+        [InlineKeyboardButton("🔄 Yangilash", callback_data="admin:home")],
+    ])
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_bot_owner(update):
+        message = update.effective_message
+        if message:
+            await message.reply_text("⛔ Bu paneldan foydalanishga ruxsatingiz yo‘q.")
+        return
+
+    message = update.effective_message
+    if message:
+        await message.reply_text(
+            "👑 <b>AntiPhish Guard — Admin Panel</b>\n\n"
+            "Quyidagi bo‘limlardan birini tanlang.",
+            parse_mode="HTML",
+            reply_markup=owner_admin_keyboard(),
+        )
+
+
+async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+
+    if not is_bot_owner(update):
+        await query.answer("⛔ Ruxsat yo‘q.", show_alert=True)
+        return
+
+    await query.answer()
+    action = query.data or "admin:home"
+
+    try:
+        if action == "admin:home":
+            await query.edit_message_text(
+                "👑 <b>AntiPhish Guard — Admin Panel</b>\n\nBo‘limni tanlang:",
+                parse_mode="HTML",
+                reply_markup=owner_admin_keyboard(),
+            )
+            return
+
+        if action == "admin:stats":
+            conn = db_connect()
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM groups")
+            groups_total = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM groups WHERE enabled = 1")
+            groups_enabled = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM incidents")
+            incidents_total = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM business_connections WHERE is_enabled = 1")
+            business_total = cur.fetchone()[0]
+            conn.close()
+
+            text = (
+                "📊 <b>Bot statistikasi</b>\n\n"
+                f"👥 Jami guruhlar: <b>{groups_total}</b>\n"
+                f"🟢 Himoyasi yoqilgan guruhlar: <b>{groups_enabled}</b>\n"
+                f"🚨 Bazadagi tahdid yozuvlari: <b>{incidents_total}</b>\n"
+                f"💼 Faol Business ulanishlari: <b>{business_total}</b>"
+            )
+            await query.edit_message_text(
+                text, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Admin Panel", callback_data="admin:home")]])
+            )
+            return
+
+        if action.startswith("admin:groups:"):
+            try:
+                offset = max(0, int(action.rsplit(":", 1)[1]))
+            except (ValueError, IndexError):
+                offset = 0
+
+            conn = db_connect()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT chat_id, title, enabled FROM groups ORDER BY created_at DESC LIMIT 8 OFFSET ?",
+                (offset,),
+            )
+            rows = cur.fetchall()
+            cur.execute("SELECT COUNT(*) FROM groups")
+            total = cur.fetchone()[0]
+            conn.close()
+
+            lines = ["👥 <b>Guruhlarni boshqarish</b>", ""]
+            buttons = []
+            if not rows:
+                lines.append("Hozircha guruhlar topilmadi.")
+            for chat_id, title, enabled in rows:
+                safe_title = html.escape(title or str(chat_id))
+                state = "🟢 Yoqilgan" if enabled else "🔴 O‘chirilgan"
+                lines.append(f"{safe_title} (<code>{chat_id}</code>) — {state}")
+                button_text = ("🔴 Himoyani o‘chirish" if enabled else "🟢 Himoyani yoqish")
+                buttons.append([InlineKeyboardButton(button_text + f" · {safe_title[:22]}", callback_data=f"admin:toggle:{chat_id}:{0 if enabled else 1}:{offset}")])
+
+            nav = []
+            if offset > 0:
+                nav.append(InlineKeyboardButton("⬅️ Oldingi", callback_data=f"admin:groups:{max(0, offset-8)}"))
+            if offset + 8 < total:
+                nav.append(InlineKeyboardButton("Keyingi ➡️", callback_data=f"admin:groups:{offset+8}"))
+            if nav:
+                buttons.append(nav)
+            buttons.append([InlineKeyboardButton("⬅️ Admin Panel", callback_data="admin:home")])
+            lines.append(f"\nJami: {total} ta guruh")
+            await query.edit_message_text(
+                "\n".join(lines), parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+            return
+
+        if action.startswith("admin:toggle:"):
+            parts = action.split(":")
+            if len(parts) != 5:
+                await query.edit_message_text("⚠️ Noto‘g‘ri so‘rov.", reply_markup=owner_admin_keyboard())
+                return
+            chat_id, enabled, offset = int(parts[2]), int(parts[3]), int(parts[4])
+            conn = db_connect()
+            cur = conn.cursor()
+            cur.execute("UPDATE groups SET enabled = ? WHERE chat_id = ?", (enabled, chat_id))
+            changed = cur.rowcount
+            conn.commit()
+            conn.close()
+            if not changed:
+                await query.edit_message_text(
+                    "⚠️ Guruh bazadan topilmadi.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Guruhlar", callback_data=f"admin:groups:{offset}")]])
+                )
+                return
+            # Mavjud set_protection va himoya logikasini o‘zgartirmaymiz;
+            # bazadagi enabled qiymati yangilanadi.
+            context.user_data["admin_notice"] = "🟢 Himoya yoqildi." if enabled else "🔴 Himoya o‘chirildi."
+            # Qayta chizishda guruhlar ro‘yxatiga qaytadi.
+            await query.edit_message_text(
+                ("🟢 Himoya yoqildi.\n\n" if enabled else "🔴 Himoya o‘chirildi.\n\n") + "Guruhlar ro‘yxati:",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Guruhlarga qaytish", callback_data=f"admin:groups:{offset}")], [InlineKeyboardButton("🏠 Admin Panel", callback_data="admin:home")]])
+            )
+            return
+
+        if action == "admin:incidents":
+            conn = db_connect()
+            cur = conn.cursor()
+            cur.execute("SELECT chat_id, username, url, created_at FROM incidents ORDER BY id DESC LIMIT 10")
+            rows = cur.fetchall()
+            conn.close()
+
+            lines = ["🚨 <b>Oxirgi tahdidlar</b>", ""]
+            if not rows:
+                lines.append("Hozircha tahdid yozuvlari yo‘q.")
+            for chat_id, username, url, created_at in rows:
+                safe_user = html.escape(username or "Noma’lum")
+                safe_url = html.escape(url or "")
+                safe_date = html.escape(created_at or "")
+                lines.append(f"• <b>{safe_user}</b> | chat <code>{chat_id}</code>\n{safe_url}\n<i>{safe_date}</i>\n")
+            await query.edit_message_text(
+                "\n".join(lines), parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Admin Panel", callback_data="admin:home")]])
+            )
+            return
+
+        await query.edit_message_text(
+            "👑 <b>Admin Panel</b>", parse_mode="HTML",
+            reply_markup=owner_admin_keyboard(),
+        )
+    except Exception:
+        logger.exception("Admin panel xatosi")
+        try:
+            await query.edit_message_text(
+                "⚠️ Admin panelda xatolik yuz berdi. Loglarni tekshiring.",
+                reply_markup=owner_admin_keyboard(),
+            )
+        except Exception:
+            pass
+
+
+# =========================================================
 # MAIN
 # =========================================================
 
@@ -1584,6 +1778,10 @@ def main():
     init_language_db()
 
     application = Application.builder().token(BOT_TOKEN).build()
+
+    # Faqat loyiha egasi uchun Admin Panel
+    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern=r"^admin:"))
 
     # Komandalar
     application.add_handler(CommandHandler("start", start))
