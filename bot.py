@@ -56,7 +56,7 @@ if not BOT_TOKEN:
 
 # Faqat loyiha egasi foydalana oladigan Admin Panel
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+ADMIN_PASSWORD = "MySecurePass2026"  # Admin panel paroli shu yerda saqlanadi
 
 
 # =========================================================
@@ -1607,11 +1607,6 @@ def owner_admin_keyboard():
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if not message:
-        return
-    if not ADMIN_PASSWORD:
-        await message.reply_text(
-            "⚠️ Admin paroli sozlanmagan. Loyihadagi .env fayliga ADMIN_PASSWORD=parolingiz qatorini qo‘shing, so‘ng botni qayta ishga tushiring."
-        )
         return
     user = update.effective_user
     if ADMIN_ID > 0 and user and user.id != ADMIN_ID:
