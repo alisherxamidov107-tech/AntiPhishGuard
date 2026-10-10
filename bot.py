@@ -56,6 +56,7 @@ if not BOT_TOKEN:
 
 # Faqat loyiha egasi foydalana oladigan Admin Panel
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 
 
 # =========================================================
@@ -1583,10 +1584,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 
 
-def is_bot_owner(update: Update) -> bool:
-    """Admin panel faqat .env dagi ADMIN_ID egasiga ochiladi."""
+def is_bot_owner(update: Update, context: ContextTypes.DEFAULT_TYPE = None) -> bool:
+    """Admin panel access after password verification; optional ADMIN_ID restriction."""
     user = update.effective_user
-    return bool(user and ADMIN_ID > 0 and user.id == ADMIN_ID)
+    if not user:
+        return False
+    # If ADMIN_ID is configured, only that Telegram account can use the panel.
+    if ADMIN_ID > 0 and user.id != ADMIN_ID:
+        return False
+    return bool(context and context.user_data.get("admin_authenticated"))
 
 
 def owner_admin_keyboard():
@@ -1599,20 +1605,51 @@ def owner_admin_keyboard():
 
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_bot_owner(update):
-        message = update.effective_message
-        if message:
-            await message.reply_text("⛔ Bu paneldan foydalanishga ruxsatingiz yo‘q.")
+    message = update.effective_message
+    if not message:
+        return
+    if not ADMIN_PASSWORD:
+        await message.reply_text(
+            "⚠️ Admin paroli sozlanmagan. Loyihadagi .env fayliga ADMIN_PASSWORD=parolingiz qatorini qo‘shing, so‘ng botni qayta ishga tushiring."
+        )
+        return
+    user = update.effective_user
+    if ADMIN_ID > 0 and user and user.id != ADMIN_ID:
+        await message.reply_text("⛔ Bu paneldan foydalanishga ruxsatingiz yo‘q.")
+        return
+    context.user_data["awaiting_admin_password"] = True
+    context.user_data.pop("admin_authenticated", None)
+    await message.reply_text("🔐 Admin panelga kirish uchun parolni kiriting:")
+
+
+async def admin_password_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle password replies in private chat before normal message scanning."""
+    if not context.user_data.get("awaiting_admin_password"):
+        return
+    message = update.effective_message
+    if not message or not message.text or message.text.startswith("/"):
+        return
+    if update.effective_chat and update.effective_chat.type != "private":
         return
 
-    message = update.effective_message
-    if message:
-        await message.reply_text(
-            "👑 <b>AntiPhish Guard — Admin Panel</b>\n\n"
-            "Quyidagi bo‘limlardan birini tanlang.",
-            parse_mode="HTML",
-            reply_markup=owner_admin_keyboard(),
-        )
+    supplied = message.text.strip()
+    context.user_data["awaiting_admin_password"] = False
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    if supplied != ADMIN_PASSWORD:
+        context.user_data.pop("admin_authenticated", None)
+        await update.effective_chat.send_message("❌ Parol noto‘g‘ri. Qayta urinib ko‘rish uchun /admin yuboring.")
+        return
+
+    context.user_data["admin_authenticated"] = True
+    await update.effective_chat.send_message(
+        "✅ Parol to‘g‘ri!\n\n👑 <b>AntiPhish Guard — Admin Panel</b>\n\nQuyidagi bo‘limlardan birini tanlang.",
+        parse_mode="HTML",
+        reply_markup=owner_admin_keyboard(),
+    )
 
 
 async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1620,8 +1657,8 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if not query:
         return
 
-    if not is_bot_owner(update):
-        await query.answer("⛔ Ruxsat yo‘q.", show_alert=True)
+    if not is_bot_owner(update, context):
+        await query.answer("⛔ Avval /admin orqali parol bilan kiring.", show_alert=True)
         return
 
     await query.answer()
@@ -1782,6 +1819,7 @@ def main():
     # Faqat loyiha egasi uchun Admin Panel
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern=r"^admin:"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, admin_password_message), group=0)
 
     # Komandalar
     application.add_handler(CommandHandler("start", start))
