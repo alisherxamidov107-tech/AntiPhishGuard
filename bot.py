@@ -55,7 +55,6 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN topilmadi. .env faylini tekshiring.")
 
 # Faqat loyiha egasi foydalana oladigan Admin Panel
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 ADMIN_PASSWORD = "alisher09022"  # Admin panel paroli shu yerda saqlanadi
 
 
@@ -1585,14 +1584,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 def is_bot_owner(update: Update, context: ContextTypes.DEFAULT_TYPE = None) -> bool:
-    """Admin panel access after password verification; optional ADMIN_ID restriction."""
+    """Allow panel callbacks only after this Telegram session passed the password."""
     user = update.effective_user
-    if not user:
+    if not user or not context:
         return False
-    # If ADMIN_ID is configured, only that Telegram account can use the panel.
-    if ADMIN_ID > 0 and user.id != ADMIN_ID:
-        return False
-    return bool(context and context.user_data.get("admin_authenticated"))
+    return bool(context.user_data.get("admin_authenticated"))
 
 
 def owner_admin_keyboard():
@@ -1608,9 +1604,8 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if not message:
         return
-    user = update.effective_user
-    if ADMIN_ID > 0 and user and user.id != ADMIN_ID:
-        await message.reply_text("⛔ Bu paneldan foydalanishga ruxsatingiz yo‘q.")
+    if not update.effective_chat or update.effective_chat.type != "private":
+        await message.reply_text("🔒 Xavfsizlik uchun /admin buyrug‘ini bot bilan shaxsiy chatda yuboring.")
         return
     context.user_data["awaiting_admin_password"] = True
     context.user_data.pop("admin_authenticated", None)
@@ -1814,7 +1809,7 @@ def main():
     # Faqat loyiha egasi uchun Admin Panel
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern=r"^admin:"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, admin_password_message), group=0)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, admin_password_message), group=-1)
 
     # Komandalar
     application.add_handler(CommandHandler("start", start))
