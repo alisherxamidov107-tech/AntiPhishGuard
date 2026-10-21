@@ -6,6 +6,7 @@ import socket
 import sqlite3
 import logging
 import asyncio
+import ipaddress
 import urllib.parse
 import urllib.request
 from urllib.parse import urlparse
@@ -18,8 +19,9 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    BotCommand,
 )
-from telegram.constants import ChatMemberStatus
+from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -30,6 +32,7 @@ from telegram.ext import (
     BusinessConnectionHandler,
     filters,
 )
+from telegram.error import TelegramError
 
 from services.scanner import scan_text, extract_urls
 from i18n import (
@@ -68,7 +71,7 @@ logger = logging.getLogger(__name__)
 
 
 # =========================================================
-# QO'SHIMCHA MATNLAR (i18n.py da yo'q kalitlar)
+# QO'SHIMCHA MATNLAR
 # =========================================================
 
 EXTRA = {
@@ -407,28 +410,35 @@ for _lang, _texts in BIZ_TEXTS.items():
 def t(lang: str, key: str, **kwargs) -> str:
     """Avval EXTRA, topilmasa i18n.tr dan matn oladi."""
     table = EXTRA.get(lang, EXTRA["uz"])
+    text = table.get(key)
 
-    if key in table or key in EXTRA["uz"]:
-        text = table.get(key) or EXTRA["uz"][key]
-        if kwargs:
-            try:
-                return text.format(**kwargs)
-            except (KeyError, IndexError):
-                return text
-        return text
+    if text is None:
+        # i18n dan olishga harakat qilamiz
+        try:
+            text = tr(lang, key, **kwargs)
+            return text
+        except Exception:
+            text = EXTRA["uz"].get(key, key)
 
-    return tr(lang, key, **kwargs)
+    if kwargs:
+        try:
+            return text.format(**kwargs)
+        except (KeyError, IndexError):
+            return text
+    return text
 
 
 # =========================================================
 # DATABASE
 # =========================================================
 
-DB_NAME = "database.db"
+DB_NAME = os.getenv("DB_NAME", "database.db")
 
 
 def db_connect():
-    return sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
 
 
 def init_db():
@@ -479,12 +489,11 @@ def init_db():
 
 
 def save_business_connection(bc):
-    """Telegram BusinessConnection obyektini bazaga saqlaydi."""
     rights = getattr(bc, "rights", None)
     can_delete = (
         bool(getattr(rights, "can_delete_all_messages", False))
         if rights is not None
-        else True  # eski versiyalarda huquq ma'lum emas
+        else True
     )
 
     conn = db_connect()
@@ -598,19 +607,19 @@ def get_stats(chat_id: int) -> int:
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not update.effective_chat or not update.effective_user:
         return False
+    if update.effective_chat.type not in ("group", "supergroup"):
+        return False
 
     try:
         member = await context.bot.get_chat_member(
             update.effective_chat.id,
             update.effective_user.id,
         )
-
         return member.status in (
             ChatMemberStatus.ADMINISTRATOR,
             ChatMemberStatus.OWNER,
         )
-
-    except Exception as e:
+    except TelegramError as e:
         logger.error("Admin tekshirish xatosi: %s", e)
         return False
 
@@ -647,7 +656,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat = update.effective_chat
 
-    # Shaxsiy chatda /start bosilganda AVVAL til tanlanadi.
     if chat and chat.type == "private":
         await message.reply_text(
             language_selection_text(),
@@ -656,7 +664,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Guruhda to'g'ridan-to'g'ri asosiy menyu (guruh tilida).
     lang = language_for_update(update)
 
     await message.reply_text(
@@ -668,44 +675,49 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not query:
+        return
     await query.answer()
 
     lang = language_for_update(update)
 
-    if query.data == "guide":
-        await query.edit_message_text(
-            t(lang, "guide_text"),
-            parse_mode="HTML",
-            reply_markup=back_keyboard(lang),
-        )
+    try:
+        if query.data == "guide":
+            await query.edit_message_text(
+                t(lang, "guide_text"),
+                parse_mode="HTML",
+                reply_markup=back_keyboard(lang),
+            )
 
-    elif query.data == "protection":
-        await query.edit_message_text(
-            t(lang, "protection_text"),
-            parse_mode="HTML",
-            reply_markup=back_keyboard(lang),
-        )
+        elif query.data == "protection":
+            await query.edit_message_text(
+                t(lang, "protection_text"),
+                parse_mode="HTML",
+                reply_markup=back_keyboard(lang),
+            )
 
-    elif query.data == "statistics":
-        chat = query.message.chat if query.message else None
+        elif query.data == "statistics":
+            chat = query.message.chat if query.message else None
 
-        if chat and chat.type in ("group", "supergroup"):
-            text = t(lang, "stats_title", total=get_stats(chat.id))
-        else:
-            text = t(lang, "stats_private")
+            if chat and chat.type in ("group", "supergroup"):
+                text = t(lang, "stats_title", total=get_stats(chat.id))
+            else:
+                text = t(lang, "stats_private")
 
-        await query.edit_message_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=back_keyboard(lang),
-        )
+            await query.edit_message_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=back_keyboard(lang),
+            )
 
-    elif query.data == "home":
-        await query.edit_message_text(
-            t(lang, "home_text"),
-            parse_mode="HTML",
-            reply_markup=await main_keyboard(context, lang),
-        )
+        elif query.data == "home":
+            await query.edit_message_text(
+                t(lang, "home_text"),
+                parse_mode="HTML",
+                reply_markup=await main_keyboard(context, lang),
+            )
+    except TelegramError as e:
+        logger.warning("Menu callback xatosi: %s", e)
 
 
 # =========================================================
@@ -726,6 +738,8 @@ async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not query:
+        return
     data = query.data or ""
 
     if data == "language":
@@ -746,7 +760,6 @@ async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = query.from_user
 
         if chat and chat.type in ("group", "supergroup"):
-            # Guruh tilini faqat adminlar o'zgartiradi.
             if not await is_admin(update, context):
                 await query.answer(
                     t(get_language("chat", chat.id), "admin_only_lang"),
@@ -759,7 +772,6 @@ async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.answer()
 
-        # Shaxsiy chat: til tanlangach asosiy menyu chiqadi.
         if chat and chat.type == "private":
             await query.edit_message_text(
                 tr(lang, "language_saved") + "\n\n" + t(lang, "home_text"),
@@ -832,1122 +844,4 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lang = language_for_update(update)
 
-    if chat.type not in ("group", "supergroup"):
-        await message.reply_text(tr(lang, "group_only"))
-        return
-
-    key = "status_on" if is_protection_enabled(chat.id) else "status_off"
-    await message.reply_text(t(lang, key), parse_mode="HTML")
-
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    message = update.effective_message
-
-    if not chat or not message:
-        return
-
-    lang = language_for_update(update)
-    total = get_stats(chat.id)
-
-    await message.reply_text(
-        t(lang, "stats_title", total=total),
-        parse_mode="HTML",
-    )
-
-
-# =========================================================
-# LINK IP / LOCATION LOOKUP
-# =========================================================
-
-def get_link_info(url: str):
-    """
-    Domen DNS orqali server IP manzilini aniqlaydi.
-    Geo-ma'lumot server IP ga tegishli va taxminiy; linkni yuborgan odamning
-    IP manzili yoki aniq jismoniy manzili aniqlanmaydi.
-    """
-    try:
-        clean_url = (url or "").strip().rstrip(".,!?;:)")
-        if not clean_url:
-            return None
-        if not clean_url.lower().startswith(("http://", "https://")):
-            clean_url = "https://" + clean_url
-
-        parsed = urlparse(clean_url)
-        domain = parsed.hostname
-        if not domain:
-            return None
-        domain = domain.encode("idna").decode("ascii").lower()
-
-        # DNS bir nechta IP qaytarishi mumkin; ommaviy IP tanlanadi.
-        records = socket.getaddrinfo(domain, None, type=socket.SOCK_STREAM)
-        ips = []
-        for record in records:
-            candidate = record[4][0]
-            try:
-                ip_obj = ipaddress.ip_address(candidate)
-                if ip_obj.is_global and candidate not in ips:
-                    ips.append(candidate)
-            except ValueError:
-                continue
-        if not ips:
-            return None
-
-        ip = ips[0]
-        country = "?"
-        city = "?"
-        isp = "?"
-        try:
-            request = urllib.request.Request(
-                f"https://ipwho.is/{urllib.parse.quote(ip, safe='')}",
-                headers={"User-Agent": "AntiPhishGuard/1.0"},
-            )
-            with urllib.request.urlopen(request, timeout=8) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            if data.get("success") is True:
-                connection = data.get("connection") or {}
-                country = data.get("country") or "?"
-                city = data.get("city") or "?"
-                isp = connection.get("isp") or connection.get("org") or "?"
-        except Exception as e:
-            logger.warning("IP geolocation xatosi: %s", e)
-
-        return {"domain": domain, "ip": ip, "country": country, "city": city, "isp": isp}
-    except Exception as e:
-        logger.warning("Link IP aniqlash xatosi: %s", e)
-        return None
-
-
-async def build_link_block(url: str, lang: str, with_title: bool = False) -> str:
-    """Link haqida server IP/joylashuv bloki (HTML)."""
-    info = await asyncio.to_thread(get_link_info, url)
-    unknown = tr(lang, "not_found")
-
-    def val(x):
-        return html.escape(unknown if x in (None, "", "?") else str(x))
-
-    lines = []
-
-    if with_title:
-        lines += [tr(lang, "link_analysis"), ""]
-
-    lines.append(f"{tr(lang, 'link')}: <code>{html.escape(url)}</code>")
-
-    if info:
-        lines += [
-            f"{tr(lang, 'domain')}: <code>{html.escape(info['domain'])}</code>",
-            f"{tr(lang, 'server_ip')}: <code>{html.escape(info['ip'])}</code>",
-            f"{tr(lang, 'country')}: {val(info['country'])}",
-            f"{tr(lang, 'city')}: {val(info['city'])}",
-            f"{tr(lang, 'isp')}: {val(info['isp'])}",
-            "ℹ️ Bu server IP manzilining taxminiy geolokatsiyasi; havolani yuborgan odamning joylashuvi emas.",
-        ]
-    else:
-        lines.append(tr(lang, "ip_failed"))
-
-    return "\n".join(lines)
-
-
-# =========================================================
-# MESSAGE SCANNER
-# =========================================================
-
-def is_apk_document(document) -> bool:
-    if not document:
-        return False
-
-    file_name = (document.file_name or "").lower()
-    mime_type = (document.mime_type or "").lower()
-
-    return (
-        file_name.endswith(".apk")
-        or mime_type == "application/vnd.android.package-archive"
-    )
-
-
-async def scan_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    chat = update.effective_chat
-
-    if not message or not chat:
-        return
-
-    # Business xabarlar alohida handlerda qayta ishlanadi.
-    if getattr(message, "business_connection_id", None):
-        return
-
-    is_private = chat.type == "private"
-    is_group = chat.type in ("group", "supergroup")
-
-    if not (is_private or is_group):
-        return
-
-    # Guruhda himoya o'chirilgan bo'lsa tekshirmaymiz.
-    if is_group and not is_protection_enabled(chat.id):
-        return
-
-    user = update.effective_user
-    lang = language_for_update(update)
-    username = user.mention_html() if user else "User"
-    username_db = user.username if user and user.username else ""
-    user_id = user.id if user else 0
-
-    # =====================================================
-    # 1) HAMMA APK FAYLLARNI O'CHIRISH
-    # =====================================================
-    if is_apk_document(message.document):
-        try:
-            await message.delete()
-        except Exception as e:
-            logger.warning("APK xabarini o'chirib bo'lmadi: %s", e)
-
-        try:
-            scanning = await context.bot.send_message(
-                chat_id=chat.id,
-                text=tr(lang, "apk_title"),
-                parse_mode="HTML",
-            )
-            await asyncio.sleep(0.7)
-            await scanning.edit_text(
-                tr(lang, "apk_blocked", user=username),
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logger.warning("APK ogohlantirishida xato: %s", e)
-
-        return
-
-    # =====================================================
-    # 2) LINKLARNI TAHLIL QILISH
-    # =====================================================
-    text = message.text or message.caption or ""
-    if not text:
-        return
-
-    urls = extract_urls(text)
-    if not urls:
-        return
-
-    dangerous_urls = scan_text(text)
-
-    # ---------- Shaxsiy chat (botga yuborilgan) ----------
-    if is_private:
-        blocks = []
-
-        for url in urls:
-            block = await build_link_block(url, lang, with_title=True)
-            verdict = (
-                tr(lang, "verdict_danger")
-                if url in dangerous_urls
-                else tr(lang, "verdict_safe")
-            )
-            blocks.append(f"{block}\n\n{verdict}\n{tr(lang, 'approx_location')}")
-
-        result_text = "\n\n".join(blocks)
-
-        if dangerous_urls:
-            for url in dangerous_urls:
-                save_incident(chat.id, user_id, username_db, url)
-
-            try:
-                await message.delete()
-            except Exception as e:
-                logger.warning("Shaxsiy chatda o'chirib bo'lmadi: %s", e)
-
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text=result_text,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-        else:
-            await message.reply_text(
-                result_text,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-
-        return
-
-    # ---------- Guruh ----------
-    if not dangerous_urls:
-        return
-
-    blocks = [await build_link_block(url, lang) for url in dangerous_urls]
-
-    for url in dangerous_urls:
-        save_incident(chat.id, user_id, username_db, url)
-
-    try:
-        await message.delete()
-    except Exception as e:
-        logger.warning("Xabarni o'chirib bo'lmadi: %s", e)
-
-    try:
-        scanning = await context.bot.send_message(
-            chat_id=chat.id,
-            text=tr(lang, "scan_title"),
-            parse_mode="HTML",
-        )
-        await asyncio.sleep(0.7)
-        await scanning.edit_text(
-            tr(
-                lang,
-                "phishing_blocked",
-                user=username,
-                details="\n\n".join(blocks),
-            ),
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-    except Exception as e:
-        logger.error("Warning yuborishda xato: %s", e)
-
-
-# =========================================================
-# BUSINESS CHATLAR (Telegram Premium: Settings -> Business -> Chatbots)
-# =========================================================
-
-async def delete_business_message(context, connection_id: str, message_id: int):
-    bot = context.bot
-
-    if hasattr(bot, "delete_business_messages"):
-        return await bot.delete_business_messages(
-            business_connection_id=connection_id,
-            message_ids=[message_id],
-        )
-
-    return await bot.do_api_request(
-        "deleteBusinessMessages",
-        api_kwargs={
-            "business_connection_id": connection_id,
-            "message_ids": [message_id],
-        },
-    )
-
-
-async def get_business_conn(context, connection_id: str):
-    conn = get_business_connection(connection_id)
-
-    if conn:
-        return conn
-
-    # Baza tozalangan bo'lsa, Telegram'dan qayta so'raymiz.
-    try:
-        bc = await context.bot.get_business_connection(connection_id)
-        save_business_connection(bc)
-        return get_business_connection(connection_id)
-    except Exception as e:
-        logger.warning("Business ulanishni olib bo'lmadi: %s", e)
-        return None
-
-
-async def business_connection_update(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    bc = update.business_connection
-
-    if not bc:
-        return
-
-    save_business_connection(bc)
-
-    lang = get_language("user", bc.user.id)
-
-    if not bc.is_enabled:
-        text = t(lang, "biz_disconnected")
-    else:
-        conn = get_business_connection(bc.id)
-        text = t(lang, "biz_connected")
-
-        if conn and not conn["can_delete"]:
-            text += "\n\n" + t(lang, "biz_no_delete")
-
-    try:
-        await context.bot.send_message(
-            chat_id=bc.user_chat_id,
-            text=text,
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logger.warning("Business ulanish xabarini yuborib bo'lmadi: %s", e)
-
-
-async def scan_business_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    message = update.business_message or update.edited_business_message
-
-    if not message or not message.business_connection_id:
-        return
-
-    connection_id = message.business_connection_id
-    conn = await get_business_conn(context, connection_id)
-
-    if not conn or not conn["is_enabled"]:
-        return
-
-    owner_id = conn["user_id"]
-    owner_chat_id = conn["user_chat_id"]
-    sender = message.from_user
-
-    # Faqat boshqalardan kelgan xabarlar tekshiriladi.
-    if sender and sender.id == owner_id:
-        return
-
-    lang = get_language("user", owner_id)
-
-    is_apk = is_apk_document(message.document)
-    dangerous_urls = []
-
-    if not is_apk:
-        text = message.text or message.caption or ""
-        if not text:
-            return
-
-        dangerous_urls = scan_text(text)
-        if not dangerous_urls:
-            return  # Xavfsiz xabar: tegmaymiz.
-
-    # Xabarni o'chirish.
-    deleted = False
-    try:
-        await delete_business_message(context, connection_id, message.message_id)
-        deleted = True
-    except Exception as e:
-        logger.warning("Business xabarni o'chirib bo'lmadi: %s", e)
-
-    # Hodisani saqlash.
-    sender_id = sender.id if sender else 0
-    sender_username = sender.username if sender and sender.username else ""
-
-    for url in (dangerous_urls or ["APK"]):
-        save_incident(owner_chat_id, sender_id, sender_username, url)
-
-    # Ogohlantirish faqat egasiga (bot bilan chatga) yuboriladi.
-    sender_name = html.escape(sender.full_name) if sender else "?"
-    if sender and sender.username:
-        sender_name += f" (@{html.escape(sender.username)})"
-
-    chat_name = html.escape(message.chat.full_name or str(message.chat.id))
-
-    if is_apk:
-        notice = t(lang, "biz_apk", sender=sender_name, chat=chat_name)
-    else:
-        blocks = [await build_link_block(u, lang) for u in dangerous_urls]
-        notice = t(
-            lang,
-            "biz_phish",
-            sender=sender_name,
-            chat=chat_name,
-            details="\n\n".join(blocks),
-        )
-
-    notice += "\n\n" + t(lang, "biz_deleted" if deleted else "biz_not_deleted")
-
-    try:
-        await context.bot.send_message(
-            chat_id=owner_chat_id,
-            text=notice,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-    except Exception as e:
-        logger.warning("Egasiga ogohlantirish yuborilmadi: %s", e)
-
-
-# =========================================================
-# KUNLIK O'ZBEKCHA KIBERXAVFSIZLIK VIDEOSI
-# =========================================================
-
-DAILY_VIDEO_CHAT_ID = os.getenv("DAILY_VIDEO_CHAT_ID")
-DAILY_VIDEO_HOUR = int(os.getenv("DAILY_VIDEO_HOUR", "12"))
-DAILY_VIDEO_MINUTE = int(os.getenv("DAILY_VIDEO_MINUTE", "0"))
-DAILY_VIDEO_TZ = os.getenv("DAILY_VIDEO_TZ", "Asia/Tashkent")
-
-VIDEO_SEARCH_QUERIES = [
-    "Kiberxavfsizlik markazi kiberxavfsizlik",
-    "Kiberxavfsizlik markazi firibgarlik",
-    "Kiberxavfsizlik markazi himoya",
-    "ICHKI ISHLAR VAZIRLIGI kiberxavfsizlik",
-]
-
-UZBEK_CYBER_WORDS = [
-    "kiber", "xavfsizlik", "firibgarlik", "himoya", "parol",
-    "shaxsiy", "ma'lumot", "ma’lumot", "zararli", "virus",
-    "phishing", "apk", "ogoh", "firibgar", "akkaunt", "internet",
-]
-
-UZBEK_MARKERS = [
-    "o'zbek", "o‘zbek", "uzbek", "xavfsizlik",
-    "firibgarlik", "himoya", "parol", "ma'lumot",
-    "ma’lumot", "zararli", "ogoh", "firibgar",
-]
-
-TRUSTED_VIDEO_CHANNEL_HINTS = [
-    "Kiberxavfsizlik markazi",
-    "ICHKI ISHLAR VAZIRLIGI",
-    "csecuz",
-    "ichkiishlarvazirligi",
-]
-
-
-def find_uzbek_cyber_videos(limit: int = 5):
-    """
-    YouTube public search sahifasidan kiberxavfsizlikka oid
-    o'zbekcha videolarni topishga harakat qiladi.
-    Faqat havola yuboriladi, video yuklab olinmaydi.
-    """
-    found = []
-    seen = set()
-
-    for query in VIDEO_SEARCH_QUERIES:
-        try:
-            search_url = (
-                "https://www.youtube.com/results?search_query="
-                + urllib.parse.quote_plus(query)
-            )
-
-            request = urllib.request.Request(
-                search_url,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 Chrome/142 Safari/537.36"
-                    )
-                },
-            )
-
-            with urllib.request.urlopen(request, timeout=15) as response:
-                page = response.read().decode("utf-8", errors="ignore")
-
-            ids = re.findall(r'"videoId":"([A-Za-z0-9_-]{11})"', page)
-
-            for video_id in ids:
-                if video_id in seen:
-                    continue
-
-                pos = page.find('"videoId":"' + video_id + '"')
-                chunk = page[max(0, pos - 2500):pos + 5000]
-
-                title_match = re.search(
-                    r'"title":\{"runs":\[\{"text":"(.*?)"', chunk, re.S
-                )
-                owner_match = re.search(
-                    r'"ownerText":\{"runs":\[\{"text":"(.*?)"', chunk, re.S
-                )
-
-                title = (
-                    html.unescape(title_match.group(1))
-                    if title_match
-                    else "Kiberxavfsizlik videosi"
-                )
-                owner = (
-                    html.unescape(owner_match.group(1))
-                    if owner_match
-                    else ""
-                )
-
-                title_lower = title.lower()
-                owner_lower = owner.lower()
-
-                if not any(w in title_lower for w in UZBEK_CYBER_WORDS):
-                    continue
-
-                if not any(m in title_lower for m in UZBEK_MARKERS):
-                    continue
-
-                if not any(
-                    h.lower() in owner_lower
-                    for h in TRUSTED_VIDEO_CHANNEL_HINTS
-                ):
-                    continue
-
-                seen.add(video_id)
-                found.append({
-                    "id": video_id,
-                    "title": title[:200],
-                    "url": f"https://www.youtube.com/watch?v={video_id}",
-                })
-
-                if len(found) >= limit:
-                    return found
-
-        except Exception as e:
-            logger.warning("YouTube qidiruv xatosi (%s): %s", query, e)
-
-    return found
-
-
-def get_last_daily_video_id():
-    conn = db_connect()
-    cursor = conn.cursor()
-    cursor.execute("SELECT last_video_id FROM daily_video_state WHERE id = 1")
-    row = cursor.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-
-def save_last_daily_video_id(video_id: str):
-    conn = db_connect()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO daily_video_state (id, last_video_id, updated_at)
-        VALUES (1, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            last_video_id = excluded.last_video_id,
-            updated_at = excluded.updated_at
-    """, (video_id, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
-
-
-def video_message_text(lang: str, video: dict, with_footer: bool = True) -> str:
-    text = (
-        f"{t(lang, 'video_title')}\n\n"
-        f"🎥 <b>{html.escape(video['title'])}</b>\n\n"
-        f"<a href=\"{html.escape(video['url'])}\">{t(lang, 'video_watch')}</a>"
-    )
-
-    if with_footer:
-        text += "\n\n🛡️ <b>AntiPhish Guard</b>"
-
-    return text
-
-
-async def send_daily_cyber_video(context: ContextTypes.DEFAULT_TYPE):
-    """Har kuni bir marta ro'yxatdan o'tgan guruhlarga video havolasini yuboradi."""
-
-    videos = await asyncio.to_thread(find_uzbek_cyber_videos, 5)
-
-    if not videos:
-        logger.warning("O'zbekcha kiberxavfsizlik videosi topilmadi.")
-        return
-
-    last_video_id = get_last_daily_video_id()
-    video = next(
-        (item for item in videos if item["id"] != last_video_id),
-        videos[0],
-    )
-
-    conn = db_connect()
-    cursor = conn.cursor()
-    cursor.execute("SELECT chat_id FROM groups WHERE enabled = 1")
-    chat_ids = [row[0] for row in cursor.fetchall()]
-    conn.close()
-
-    if DAILY_VIDEO_CHAT_ID:
-        try:
-            extra_id = int(DAILY_VIDEO_CHAT_ID)
-            if extra_id not in chat_ids:
-                chat_ids.append(extra_id)
-        except ValueError:
-            logger.warning("DAILY_VIDEO_CHAT_ID noto'g'ri: %s", DAILY_VIDEO_CHAT_ID)
-
-    sent_any = False
-
-    for chat_id in chat_ids:
-        try:
-            lang = get_language("chat", chat_id)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=video_message_text(lang, video),
-                parse_mode="HTML",
-                disable_web_page_preview=False,
-            )
-            sent_any = True
-        except Exception as e:
-            logger.warning("Kunlik video %s chatga yuborilmadi: %s", chat_id, e)
-
-    if sent_any:
-        save_last_daily_video_id(video["id"])
-
-
-async def daily_video_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Darhol test uchun bitta videoni yuboradi."""
-    message = update.effective_message
-
-    if not update.effective_chat or not message:
-        return
-
-    lang = language_for_update(update)
-    videos = await asyncio.to_thread(find_uzbek_cyber_videos, 5)
-
-    if not videos:
-        await message.reply_text(tr(lang, "no_video"))
-        return
-
-    await message.reply_text(
-        video_message_text(lang, videos[0], with_footer=False),
-        parse_mode="HTML",
-        disable_web_page_preview=False,
-    )
-
-
-def setup_daily_video_job(application: Application):
-    if application.job_queue is None:
-        logger.warning(
-            "JobQueue mavjud emas. "
-            "python-telegram-bot[job-queue] paketini o'rnating."
-        )
-        return
-
-    try:
-        tz = ZoneInfo(DAILY_VIDEO_TZ)
-    except Exception:
-        tz = ZoneInfo("Asia/Tashkent")
-
-    application.job_queue.run_daily(
-        send_daily_cyber_video,
-        time=dt_time(
-            hour=DAILY_VIDEO_HOUR,
-            minute=DAILY_VIDEO_MINUTE,
-            tzinfo=tz,
-        ),
-        name="daily_uzbek_cyber_video",
-    )
-
-    logger.info(
-        "Kunlik video jobi: %02d:%02d (%s)",
-        DAILY_VIDEO_HOUR,
-        DAILY_VIDEO_MINUTE,
-        DAILY_VIDEO_TZ,
-    )
-
-
-# =========================================================
-# BOT GURUHGA QO'SHILDI / ADMIN QILINDI
-# =========================================================
-
-async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    member_update = update.my_chat_member
-
-    if not member_update:
-        return
-
-    chat = update.effective_chat
-
-    if not chat or chat.type not in ("group", "supergroup"):
-        return
-
-    old_status = member_update.old_chat_member.status
-    new_status = member_update.new_chat_member.status
-    lang = get_language("chat", chat.id)
-
-    # Bot guruhga qo'shildi.
-    if (
-        new_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR)
-        and old_status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED)
-    ):
-        register_group(chat.id, chat.title or "Unknown")
-
-        try:
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text=t(lang, "welcome_group"),
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logger.error("Welcome message error: %s", e)
-
-    # Bot admin qilindi (oldin admin bo'lmagan bo'lsa).
-    if (
-        new_status == ChatMemberStatus.ADMINISTRATOR
-        and old_status != ChatMemberStatus.ADMINISTRATOR
-    ):
-        register_group(chat.id, chat.title or "Unknown")
-
-        try:
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text=t(lang, "thanks_admin"),
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logger.error("Admin message error: %s", e)
-
-
-# =========================================================
-# GLOBAL XATO HANDLERI
-# =========================================================
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Kutilmagan xato:", exc_info=context.error)
-
-
-
-
-# =========================================================
-# OWNER ADMIN PANEL (qo'shilgan; boshqa funksiyalar o'zgartirilmagan)
-# =========================================================
-
-# Admin paroli: doimiy qiymat, .env dagi eski qiymat xalaqit bermaydi.
-ADMIN_PASSWORD = "alisher09022"
-try:
-    OWNER_TELEGRAM_ID = int(os.getenv("OWNER_TELEGRAM_ID", "0"))
-except (TypeError, ValueError):
-    OWNER_TELEGRAM_ID = 0
-
-
-def owner_admin_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Umumiy statistika", callback_data="admin:stats")],
-        [InlineKeyboardButton("👥 Guruhlar", callback_data="admin:groups:0")],
-        [InlineKeyboardButton("🚨 Oxirgi hodisalar", callback_data="admin:incidents:0")],
-        [InlineKeyboardButton("🔒 Admin paneldan chiqish", callback_data="admin:logout")],
-    ])
-
-
-async def is_bot_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user = update.effective_user
-    return bool(
-        user
-        and (not OWNER_TELEGRAM_ID or user.id == OWNER_TELEGRAM_ID)
-        and context.user_data.get("admin_authenticated") is True
-    )
-
-
-async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Foydalanuvchining Telegram raqamli ID sini ko'rsatadi."""
-    user = update.effective_user
-    message = update.effective_message
-    if user and message:
-        await message.reply_text(f"Telegram ID raqamingiz: {user.id}")
-
-
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    user = update.effective_user
-    chat = update.effective_chat
-
-    if not message or not user:
-        return
-    if not chat or chat.type != "private":
-        await message.reply_text("❌ Admin panel faqat shaxsiy chatda ishlaydi.")
-        return
-    # OWNER_TELEGRAM_ID o'rnatilgan bo'lsa, faqat shu akkaunt kiradi.
-    # U o'rnatilmagan bo'lsa, admin panel parol bilan himoyalanadi.
-    if OWNER_TELEGRAM_ID and user.id != OWNER_TELEGRAM_ID:
-        await message.reply_text("❌ Sizda admin panelga kirish huquqi yo‘q.")
-        return
-
-    context.user_data.pop("admin_authenticated", None)
-    context.user_data["admin_waiting_password"] = True
-    await message.reply_text("🔐 Admin panel parolini kiriting:")
-
-
-async def admin_password_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    user = update.effective_user
-    chat = update.effective_chat
-
-    if not message or not user or not chat or chat.type != "private":
-        return
-    if not context.user_data.get("admin_waiting_password"):
-        return
-
-    # Faqat belgilangan Telegram akkauntidan parol qabul qilinadi.
-    if OWNER_TELEGRAM_ID and user.id != OWNER_TELEGRAM_ID:
-        context.user_data.pop("admin_waiting_password", None)
-        return
-
-    supplied_password = (message.text or "").strip()
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-    context.user_data.pop("admin_waiting_password", None)
-    if supplied_password != ADMIN_PASSWORD:
-        context.user_data.pop("admin_authenticated", None)
-        await context.bot.send_message(
-            chat_id=chat.id,
-            text="❌ Parol noto‘g‘ri. Qayta kirish uchun /admin buyrug‘ini yuboring."
-        )
-        return
-
-    context.user_data["admin_authenticated"] = True
-    await context.bot.send_message(
-        chat_id=chat.id,
-        text="🛡️ <b>AntiPhish Guard — Admin panel</b>\n\nKerakli bo‘limni tanlang:",
-        parse_mode="HTML",
-        reply_markup=owner_admin_keyboard(),
-    )
-
-
-async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-
-    if not await is_bot_owner(update, context):
-        await query.answer("❌ Ruxsat yo‘q. /admin orqali qayta kiring.", show_alert=True)
-        return
-
-    data = query.data or ""
-    await query.answer()
-
-    if data == "admin:logout":
-        context.user_data.pop("admin_authenticated", None)
-        context.user_data.pop("admin_waiting_password", None)
-        try:
-            await query.edit_message_text("🔒 Admin paneldan chiqdingiz. Qayta kirish: /admin")
-        except Exception:
-            pass
-        return
-
-    if data == "admin:stats":
-        conn = db_connect()
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM groups")
-        groups_total = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM groups WHERE enabled = 1")
-        groups_enabled = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM incidents")
-        incidents_total = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM business_connections WHERE is_enabled = 1")
-        business_total = cur.fetchone()[0]
-        conn.close()
-
-        text = (
-            "📊 <b>Umumiy statistika</b>\n\n"
-            f"👥 Ro‘yxatdagi guruhlar: <b>{groups_total}</b>\n"
-            f"🛡️ Himoyasi yoqilgan guruhlar: <b>{groups_enabled}</b>\n"
-            f"🚨 Jami aniqlangan hodisalar: <b>{incidents_total}</b>\n"
-            f"💼 Faol Business ulanishlar: <b>{business_total}</b>"
-        )
-        await query.edit_message_text(
-            text, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Admin menyu", callback_data="admin:home")]
-            ])
-        )
-        return
-
-    if data.startswith("admin:groups:"):
-        try:
-            page = max(0, int(data.rsplit(":", 1)[1]))
-        except ValueError:
-            page = 0
-        page_size = 8
-        conn = db_connect()
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM groups")
-        total = cur.fetchone()[0]
-        cur.execute(
-            "SELECT chat_id, title, enabled FROM groups ORDER BY created_at DESC LIMIT ? OFFSET ?",
-            (page_size, page * page_size),
-        )
-        rows = cur.fetchall()
-        conn.close()
-
-        lines = [f"👥 <b>Guruhlar</b> — jami: {total}\n"]
-        buttons = []
-        for chat_id, title, enabled in rows:
-            title = html.escape(title or "Noma’lum guruh")
-            state = "🟢 Yoqilgan" if enabled else "🔴 O‘chirilgan"
-            lines.append(f"• <b>{title}</b>\n  ID: <code>{chat_id}</code> — {state}")
-            buttons.append([InlineKeyboardButton(
-                ("🔴 O‘chirish: " if enabled else "🟢 Yoqish: ") + (title[:35]),
-                callback_data=f"admin:toggle:{chat_id}:{1 if enabled else 0}:{page}"
-            )])
-        nav = []
-        if page > 0:
-            nav.append(InlineKeyboardButton("⬅️ Oldingi", callback_data=f"admin:groups:{page-1}"))
-        if (page + 1) * page_size < total:
-            nav.append(InlineKeyboardButton("Keyingi ➡️", callback_data=f"admin:groups:{page+1}"))
-        if nav:
-            buttons.append(nav)
-        buttons.append([InlineKeyboardButton("⬅️ Admin menyu", callback_data="admin:home")])
-        await query.edit_message_text(
-            "\n\n".join(lines), parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-        return
-
-    if data.startswith("admin:toggle:"):
-        try:
-            _, _, raw_chat_id, raw_enabled, raw_page = data.split(":")
-            chat_id, old_enabled, page = int(raw_chat_id), int(raw_enabled), int(raw_page)
-        except (ValueError, TypeError):
-            await query.edit_message_text("❌ Amal ma'lumotlari noto‘g‘ri.")
-            return
-        set_protection(chat_id, not bool(old_enabled))
-        await query.edit_message_text(
-            "✅ Guruh himoyasi holati yangilandi.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Guruhlar ro‘yxati", callback_data=f"admin:groups:{page}")],
-                [InlineKeyboardButton("⬅️ Admin menyu", callback_data="admin:home")],
-            ]),
-        )
-        return
-
-    if data.startswith("admin:incidents:"):
-        try:
-            page = max(0, int(data.rsplit(":", 1)[1]))
-        except ValueError:
-            page = 0
-        page_size = 8
-        conn = db_connect()
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM incidents")
-        total = cur.fetchone()[0]
-        cur.execute(
-            "SELECT chat_id, username, url, created_at FROM incidents "
-            "ORDER BY id DESC LIMIT ? OFFSET ?",
-            (page_size, page * page_size),
-        )
-        rows = cur.fetchall()
-        conn.close()
-
-        lines = [f"🚨 <b>Oxirgi hodisalar</b> — jami: {total}\n"]
-        for chat_id, username, url, created_at in rows:
-            lines.append(
-                f"• {html.escape(created_at or '')}\n"
-                f"  Chat ID: <code>{chat_id}</code>\n"
-                f"  Foydalanuvchi: {html.escape(username or '—')}\n"
-                f"  Havola: <code>{html.escape((url or '')[:180])}</code>"
-            )
-        if not rows:
-            lines.append("Hozircha hodisalar mavjud emas.")
-        buttons = []
-        nav = []
-        if page > 0:
-            nav.append(InlineKeyboardButton("⬅️ Oldingi", callback_data=f"admin:incidents:{page-1}"))
-        if (page + 1) * page_size < total:
-            nav.append(InlineKeyboardButton("Keyingi ➡️", callback_data=f"admin:incidents:{page+1}"))
-        if nav:
-            buttons.append(nav)
-        buttons.append([InlineKeyboardButton("⬅️ Admin menyu", callback_data="admin:home")])
-        await query.edit_message_text(
-            "\n\n".join(lines), parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-        return
-
-    if data == "admin:home":
-        await query.edit_message_text(
-            "🛡️ <b>AntiPhish Guard — Admin panel</b>\n\nKerakli bo‘limni tanlang:",
-            parse_mode="HTML",
-            reply_markup=owner_admin_keyboard(),
-        )
-        return
-
-    await query.answer("Noma’lum amal.", show_alert=True)
-
-
-
-# =========================================================
-# MAIN
-# =========================================================
-
-def main():
-    init_db()
-    init_language_db()
-
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    # Komandalar
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("protect", protect))
-    application.add_handler(CommandHandler("unprotect", unprotect))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("stats", stats))
-    application.add_handler(CommandHandler("video", daily_video_command))
-    application.add_handler(CommandHandler("language", language_command))
-    application.add_handler(CommandHandler("myid", myid_command))
-
-    # Inline tugmalar (til handleri OLDIN turishi shart)
-    application.add_handler(
-        CallbackQueryHandler(
-            language_callback,
-            pattern=r"^(language|setlang:(uz|ru|en))$",
-        )
-    )
-    application.add_handler(
-        CallbackQueryHandler(
-            menu_callback,
-            pattern=r"^(guide|protection|statistics|home)$",
-        )
-    )
-
-    # Bot guruhga qo'shilganda
-    application.add_handler(
-        ChatMemberHandler(
-            bot_added_to_group,
-            ChatMemberHandler.MY_CHAT_MEMBER,
-        )
-    )
-
-    # Business ulanish (Premium: Settings -> Business -> Chatbots)
-    application.add_handler(
-        BusinessConnectionHandler(business_connection_update)
-    )
-
-    # Business chatlardagi xabarlar (OLDIN turishi shart)
-    application.add_handler(
-        MessageHandler(
-            filters.UpdateType.BUSINESS_MESSAGES,
-            scan_business_message,
-        )
-    )
-
-    # Xabarlarni tekshirish (guruh + botga yozilgan shaxsiy chat)
-    application.add_handler(
-        MessageHandler(
-            (filters.TEXT | filters.Document.ALL | filters.CaptionRegex(r".+"))
-            & ~filters.COMMAND
-            & ~filters.UpdateType.BUSINESS_MESSAGES,
-            scan_message,
-        )
-    )
-
-    # Owner admin panel
-    application.add_handler(CommandHandler("admin", admin_command))
-    application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern=r"^admin:"))
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
-            admin_password_message,
-        ),
-        group=-1,
-    )
-
-    application.add_error_handler(error_handler)
-
-    setup_daily_video_job(application)
-
-    print("")
-    print("===================================")
-    print("🛡️ ANTIPHISH GUARD")
-    print("===================================")
-    print("Bot ishga tushdi...")
-    print("===================================")
-    print("")
-
-    render_url = os.getenv("RENDER_EXTERNAL_URL")
-
-    if render_url:
-        port = int(os.getenv("PORT", "10000"))
-        webhook_url = f"{render_url.rstrip('/')}/telegram"
-
-        print(f"🌐 Webhook: {webhook_url}")
-        print(f"🔌 Port: {port}")
-
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path="telegram",
-            webhook_url=webhook_url,
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-        )
-    else:
-        print("💻 Lokal rejim: polling")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
+    if chat.type not in ("group", "
