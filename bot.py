@@ -495,6 +495,10 @@ def init_db():
             cur.execute("ALTER TABLE groups ADD COLUMN active INTEGER DEFAULT 1")
         except sqlite3.OperationalError:
             pass
+        try:
+            cur.execute("ALTER TABLE groups ADD COLUMN kind TEXT DEFAULT 'group'")
+        except sqlite3.OperationalError:
+            pass
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS incidents (
@@ -581,15 +585,16 @@ def get_business_connection(connection_id: str):
     }
 
 
-def register_group(chat_id: int, title: str):
+def register_group(chat_id: int, title: str, kind: str = "group"):
     with db() as conn:
         conn.execute("""
-            INSERT INTO groups (chat_id, title, enabled, created_at, active)
-            VALUES (?, ?, 1, ?, 1)
+            INSERT INTO groups (chat_id, title, enabled, created_at, active, kind)
+            VALUES (?, ?, 1, ?, 1, ?)
             ON CONFLICT(chat_id) DO UPDATE SET
                 title = excluded.title,
-                active = 1
-        """, (chat_id, title, datetime.now().isoformat()))
+                active = 1,
+                kind = excluded.kind
+        """, (chat_id, title, datetime.now().isoformat(), kind))
 
 
 def mark_group_inactive(chat_id: int):
@@ -1672,6 +1677,15 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
             register_user(chat.id)
         return
 
+    if chat.type == "channel":
+        if new_status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+            mark_group_inactive(chat.id)
+            context.bot_data.setdefault("known_groups", set()).discard(chat.id)
+        elif new_status == ChatMemberStatus.ADMINISTRATOR:
+            register_group(chat.id, chat.title or "Unknown", "channel")
+            context.bot_data.setdefault("known_groups", set()).add(chat.id)
+        return
+
     if chat.type not in ("group", "supergroup"):
         return
 
@@ -1722,6 +1736,18 @@ async def track_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         known.add(chat.id)
 
 
+async def track_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kanaldagi istalgan post kelganda kanalni ro'yxatga oladi."""
+    chat = update.effective_chat
+    if not chat or chat.type != "channel":
+        return
+
+    known = context.bot_data.setdefault("known_groups", set())
+    if chat.id not in known:
+        register_group(chat.id, chat.title or "Unknown", "channel")
+        known.add(chat.id)
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Kutilmagan xato:", exc_info=context.error)
 
@@ -1741,7 +1767,7 @@ def owner_admin_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Umumiy statistika", callback_data="admin:stats")],
         [InlineKeyboardButton("👥 Guruhlar", callback_data="admin:groups:0")],
-        [InlineKeyboardButton("📣 Hamma guruhga xabar", callback_data="admin:bc")],
+        [InlineKeyboardButton("📣 Hammasiga xabar (guruh + kanal)", callback_data="admin:bc")],
         [InlineKeyboardButton("🎬 Videoni hozir yuborish", callback_data="admin:video")],
         [InlineKeyboardButton("🚨 Oxirgi hodisalar", callback_data="admin:incidents:0")],
         [InlineKeyboardButton("🔒 Chiqish", callback_data="admin:logout")],
@@ -1876,11 +1902,43 @@ async def admin_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     text = message.text or ""
     ud.pop("admin_action", None)
 
+    if action["type"] == "add":
+        target = text.strip()
+        if re.fullmatch(r"-?\d+", target):
+            target = int(target)
+        try:
+            c = await context.bot.get_chat(target)
+        except Exception as e:
+            await message.reply_text(
+                f"❌ Topilmadi: {e}\nBot shu guruh/kanalda bo‘lishi kerak.",
+                reply_markup=InlineKeyboardMarkup([admin_home_button()]),
+            )
+            raise ApplicationHandlerStop
+
+        if c.type not in ("group", "supergroup", "channel"):
+            await message.reply_text(
+                "❌ Bu guruh yoki kanal emas.",
+                reply_markup=InlineKeyboardMarkup([admin_home_button()]),
+            )
+            raise ApplicationHandlerStop
+
+        kind = "channel" if c.type == "channel" else "group"
+        register_group(c.id, c.title or str(c.id), kind)
+        context.bot_data.setdefault("known_groups", set()).add(c.id)
+        await message.reply_text(
+            f"✅ Qo‘shildi: {c.title or c.id}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👥 Ro‘yxat", callback_data="admin:groups:0")],
+                admin_home_button(),
+            ]),
+        )
+        raise ApplicationHandlerStop
+
     if action["type"] == "send":
         chat_id = action["chat_id"]
         ok, err = await send_to_chat(context.bot, chat_id, text)
         await message.reply_text(
-            "✅ Xabar guruhga yuborildi." if ok else f"❌ Yuborilmadi: {err}",
+            "✅ Xabar bot nomidan yuborildi." if ok else f"❌ Yuborilmadi: {err}",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅️ Guruh", callback_data=f"admin:g:{chat_id}:0")],
                 admin_home_button(),
@@ -1891,7 +1949,7 @@ async def admin_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if action["type"] == "broadcast":
         ud["admin_pending_broadcast"] = text
         await message.reply_text(
-            "📣 Quyidagi xabar HAMMA faol guruhlarga yuboriladi:\n\n"
+            "📣 Quyidagi xabar HAMMA faol guruh va kanallarga yuboriladi:\n\n"
             f"{text}\n\nTasdiqlaysizmi?",
             reply_markup=InlineKeyboardMarkup([
                 [
@@ -1976,24 +2034,30 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             total = conn.execute(
                 "SELECT COUNT(*) FROM groups WHERE COALESCE(active,1)=1").fetchone()[0]
             rows = conn.execute(
-                "SELECT chat_id, title, enabled FROM groups WHERE COALESCE(active,1)=1 "
+                "SELECT chat_id, title, enabled, COALESCE(kind,'group') FROM groups WHERE COALESCE(active,1)=1 "
                 "ORDER BY created_at DESC LIMIT ? OFFSET ?",
                 (PAGE_SIZE, page * PAGE_SIZE),
             ).fetchall()
 
-        lines = [f"👥 <b>Guruhlar</b> — jami: {total}\n"]
+        lines = [f"👥 <b>Guruhlar va kanallar</b> — jami: {total}\n"]
         buttons = []
-        for chat_id, title, enabled in rows:
-            raw_title = title or "Noma’lum guruh"
+        for chat_id, title, enabled, kind in rows:
+            raw_title = title or "Noma’lum"
+            icon = "📢" if kind == "channel" else "👥"
             state = "🟢" if enabled else "🔴"
-            lines.append(f"{state} <b>{html.escape(raw_title)}</b>\n<code>{chat_id}</code>")
-            buttons.append([InlineKeyboardButton(
-                f"{state} {raw_title[:40]}",
-                callback_data=f"admin:g:{chat_id}:{page}",
-            )])
+            lines.append(
+                f"{icon} <b>{html.escape(raw_title)}</b> {state}\n<code>{chat_id}</code>"
+            )
+            buttons.append([
+                InlineKeyboardButton(
+                    f"{icon} {raw_title[:30]}",
+                    callback_data=f"admin:g:{chat_id}:{page}",
+                ),
+                InlineKeyboardButton("✉️ Yozish", callback_data=f"admin:send:{chat_id}"),
+            ])
 
         if not rows:
-            lines.append("Hozircha guruhlar yo‘q.")
+            lines.append("Hozircha guruh yoki kanallar yo‘q.")
 
         nav = []
         if page > 0:
@@ -2002,6 +2066,7 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             nav.append(InlineKeyboardButton("Keyingi ➡️", callback_data=f"admin:groups:{page+1}"))
         if nav:
             buttons.append(nav)
+        buttons.append([InlineKeyboardButton("➕ Guruh/kanal qo‘shish", callback_data="admin:add")])
         buttons.append(admin_home_button())
 
         await _edit(query, "\n\n".join(lines), InlineKeyboardMarkup(buttons))
@@ -2018,7 +2083,7 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
         with db() as conn:
             row = conn.execute(
-                "SELECT title, enabled FROM groups WHERE chat_id = ?", (chat_id,)
+                "SELECT title, enabled, COALESCE(kind,'group') FROM groups WHERE chat_id = ?", (chat_id,)
             ).fetchone()
             incidents = conn.execute(
                 "SELECT COUNT(*) FROM incidents WHERE chat_id = ?", (chat_id,)
@@ -2028,14 +2093,18 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             await _edit(query, "❌ Guruh topilmadi.", InlineKeyboardMarkup([admin_home_button()]))
             return
 
-        title, enabled = row
+        title, enabled, kind = row
 
         rights = "❓ noma’lum"
         try:
             me = await context.bot.get_chat_member(chat_id, context.bot.id)
             if me.status == ChatMemberStatus.ADMINISTRATOR:
-                can_del = getattr(me, "can_delete_messages", False)
-                rights = "✅ admin" + (", o‘chirish huquqi bor" if can_del else ", ❌ o‘chirish huquqi yo‘q")
+                if kind == "channel":
+                    can_post = getattr(me, "can_post_messages", False)
+                    rights = "✅ admin" + (", post yozish huquqi bor" if can_post else ", ❌ post yozish huquqi yo‘q")
+                else:
+                    can_del = getattr(me, "can_delete_messages", False)
+                    rights = "✅ admin" + (", o‘chirish huquqi bor" if can_del else ", ❌ o‘chirish huquqi yo‘q")
             elif me.status == ChatMemberStatus.MEMBER:
                 rights = "⚠️ oddiy a’zo (admin emas)"
             else:
@@ -2043,22 +2112,26 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception:
             pass
 
+        icon = "📢" if kind == "channel" else "👥"
+        kind_name = "Kanal" if kind == "channel" else "Guruh"
         text = (
-            f"👥 <b>{html.escape(title or 'Noma’lum guruh')}</b>\n\n"
+            f"{icon} <b>{html.escape(title or 'Noma’lum')}</b>\n\n"
+            f"📌 Turi: {kind_name}\n"
             f"🆔 <code>{chat_id}</code>\n"
-            f"🛡️ Himoya: {'🟢 yoqilgan' if enabled else '🔴 o‘chirilgan'}\n"
-            f"🤖 Bot: {rights}\n"
-            f"🚨 Hodisalar: <b>{incidents}</b>"
         )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✉️ Guruhga xabar yozish", callback_data=f"admin:send:{chat_id}")],
-            [InlineKeyboardButton(
+        if kind != "channel":
+            text += f"🛡️ Himoya: {'🟢 yoqilgan' if enabled else '🔴 o‘chirilgan'}\n"
+        text += f"🤖 Bot: {rights}\n🚨 Hodisalar: <b>{incidents}</b>"
+
+        kb_rows = [[InlineKeyboardButton("✉️ Bot nomidan xabar yozish", callback_data=f"admin:send:{chat_id}")]]
+        if kind != "channel":
+            kb_rows.append([InlineKeyboardButton(
                 "🔴 Himoyani o‘chirish" if enabled else "🟢 Himoyani yoqish",
                 callback_data=f"admin:toggle:{chat_id}:{page}",
-            )],
-            [InlineKeyboardButton("⬅️ Guruhlar ro‘yxati", callback_data=f"admin:groups:{page}")],
-            admin_home_button(),
-        ])
+            )])
+        kb_rows.append([InlineKeyboardButton("⬅️ Ro‘yxat", callback_data=f"admin:groups:{page}")])
+        kb_rows.append(admin_home_button())
+        kb = InlineKeyboardMarkup(kb_rows)
         await _edit(query, text, kb)
         return
 
@@ -2085,7 +2158,19 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         ud["admin_action"] = {"type": "send", "chat_id": chat_id}
         await _edit(
             query,
-            "✉️ Guruhga yuboriladigan xabar matnini yozing:",
+            "✉️ Bot nomidan yuboriladigan xabar matnini yozing:",
+            InlineKeyboardMarkup([[InlineKeyboardButton("❌ Bekor qilish", callback_data="admin:cancel")]]),
+            html_mode=False,
+        )
+        return
+
+    # ---- Guruh/kanalni qo'lda qo'shish ----
+    if data == "admin:add":
+        ud["admin_action"] = {"type": "add"}
+        await _edit(
+            query,
+            "➕ Guruh yoki kanalning ID sini (masalan -1001234567890) "
+            "yoki @username ini yuboring.\nBot u yerda a’zo yoki admin bo‘lishi kerak.",
             InlineKeyboardMarkup([[InlineKeyboardButton("❌ Bekor qilish", callback_data="admin:cancel")]]),
             html_mode=False,
         )
@@ -2096,7 +2181,7 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         ud["admin_action"] = {"type": "broadcast"}
         await _edit(
             query,
-            "📣 Hamma faol guruhlarga yuboriladigan xabar matnini yozing:",
+            "📣 Hamma faol guruh va kanallarga yuboriladigan xabar matnini yozing:",
             InlineKeyboardMarkup([[InlineKeyboardButton("❌ Bekor qilish", callback_data="admin:cancel")]]),
             html_mode=False,
         )
@@ -2255,6 +2340,11 @@ def main():
     # Guruhlarni har qanday xabardan ro'yxatga olish (boshqa handlerlarni to'xtatmaydi)
     application.add_handler(
         MessageHandler(filters.ChatType.GROUPS, track_group, block=False),
+        group=-2,
+    )
+
+    application.add_handler(
+        MessageHandler(filters.UpdateType.CHANNEL_POSTS, track_channel, block=False),
         group=-2,
     )
 
