@@ -1583,7 +1583,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # OWNER ADMIN PANEL (qo'shilgan; boshqa funksiyalar o'zgartirilmagan)
 # =========================================================
 
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "alisher09022")
+# Admin paroli: doimiy qiymat, .env dagi eski qiymat xalaqit bermaydi.
+ADMIN_PASSWORD = "alisher09022"
 try:
     OWNER_TELEGRAM_ID = int(os.getenv("OWNER_TELEGRAM_ID", "0"))
 except (TypeError, ValueError):
@@ -1652,7 +1653,7 @@ async def admin_password_message(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data.pop("admin_waiting_password", None)
         return
 
-    supplied_password = message.text or ""
+    supplied_password = (message.text or "").strip()
     try:
         await message.delete()
     except Exception:
