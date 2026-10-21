@@ -1381,67 +1381,87 @@ def _video_matches(lang: str, title: str, owner: str) -> bool:
     return (trusted or marker) and (has_words or trusted)
 
 
-def fetch_videos_for_lang(lang: str, limit: int = 8):
-    found, seen = [], set()
-    hl = {"uz": "uz", "ru": "ru", "en": "en"}[lang]
+def fetch_query_videos(lang: str, query: str):
+    """Bitta qidiruv so'rovi bo'yicha videolar."""
+    found = []
+    hl = lang
+    try:
+        params = urllib.parse.urlencode({
+            "search_query": query,
+            "sp": "EgIQAQ==",
+            "hl": hl,
+        })
+        request = urllib.request.Request(
+            "https://www.youtube.com/results?" + params,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0 Safari/537.36"
+                ),
+                "Accept-Language": f"{hl},en;q=0.8",
+                "Cookie": "CONSENT=YES+1; SOCS=CAI",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=8) as response:
+            page = response.read().decode("utf-8", errors="ignore")
 
-    for query in VIDEO_QUERIES[lang]:
-        try:
-            params = urllib.parse.urlencode({
-                "search_query": query,
-                "sp": "EgIQAQ==",
-                "hl": hl,
-            })
-            request = urllib.request.Request(
-                "https://www.youtube.com/results?" + params,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0 Safari/537.36"
-                    ),
-                    "Accept-Language": f"{hl},en;q=0.8",
-                    "Cookie": "CONSENT=YES+1; SOCS=CAI",
-                },
-            )
-            with urllib.request.urlopen(request, timeout=15) as response:
-                page = response.read().decode("utf-8", errors="ignore")
+        m = re.search(r"ytInitialData\s*=\s*", page)
+        if not m:
+            logger.warning("YouTube ytInitialData topilmadi (%s/%s)", lang, query)
+            return found
+        data, _ = json.JSONDecoder().raw_decode(page[m.end():])
 
-            m = re.search(r"ytInitialData\s*=\s*", page)
-            if not m:
+        for vr in _walk_video_renderers(data):
+            vid = vr.get("videoId")
+            if not vid:
                 continue
-            data, _ = json.JSONDecoder().raw_decode(page[m.end():])
 
-            for vr in _walk_video_renderers(data):
-                vid = vr.get("videoId")
-                if not vid or vid in seen:
-                    continue
+            runs = (vr.get("title") or {}).get("runs") or []
+            title = runs[0].get("text", "") if runs else ""
+            oruns = (vr.get("ownerText") or {}).get("runs") or []
+            owner = oruns[0].get("text", "") if oruns else ""
+            length = (vr.get("lengthText") or {}).get("simpleText", "")
 
-                runs = (vr.get("title") or {}).get("runs") or []
-                title = runs[0].get("text", "") if runs else ""
-                oruns = (vr.get("ownerText") or {}).get("runs") or []
-                owner = oruns[0].get("text", "") if oruns else ""
-                length = (vr.get("lengthText") or {}).get("simpleText", "")
+            if not length or length.count(":") >= 2:
+                continue
+            if not title or not _video_matches(lang, title, owner):
+                continue
 
-                # Jonli efir (davomiylik yo'q) va 1 soatdan uzun videolar o'tkazib yuboriladi.
-                if not length or length.count(":") >= 2:
-                    continue
-                if not title or not _video_matches(lang, title, owner):
-                    continue
-
-                seen.add(vid)
-                found.append({
-                    "id": vid,
-                    "title": title[:200],
-                    "url": f"https://www.youtube.com/watch?v={vid}",
-                })
-                if len(found) >= limit:
-                    return found
-
-        except Exception as e:
-            logger.warning("YouTube qidiruv xatosi (%s/%s): %s", lang, query, e)
+            found.append({
+                "id": vid,
+                "title": title[:200],
+                "url": f"https://www.youtube.com/watch?v={vid}",
+            })
+    except Exception as e:
+        logger.warning("YouTube qidiruv xatosi (%s/%s): %s", lang, query, e)
 
     return found
+
+
+async def fetch_videos_for_lang_async(lang: str, limit: int = 12):
+    """Barcha so'rovlarni parallel ishga tushiradi, jami 20 soniya bilan cheklangan."""
+    tasks = [
+        asyncio.to_thread(fetch_query_videos, lang, q)
+        for q in VIDEO_QUERIES[lang]
+    ]
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True), timeout=20
+        )
+    except asyncio.TimeoutError:
+        logger.warning("YouTube qidiruvi vaqt tugadi (%s)", lang)
+        return []
+
+    merged, seen = [], set()
+    for res in results:
+        if isinstance(res, Exception):
+            continue
+        for v in res:
+            if v["id"] not in seen:
+                seen.add(v["id"])
+                merged.append(v)
+    return merged[:limit]
 
 
 async def get_videos(lang: str):
@@ -1450,11 +1470,11 @@ async def get_videos(lang: str):
     if cached and time.time() - cached[0] < VIDEO_CACHE_TTL:
         return cached[1]
 
-    videos = await asyncio.to_thread(fetch_videos_for_lang, lang)
+    videos = await fetch_videos_for_lang_async(lang)
     if videos:
         VIDEO_CACHE[lang] = (time.time(), videos)
     elif cached:
-        return cached[1]  # eski keshni ishlatamiz
+        return cached[1]
     return videos
 
 
@@ -1590,6 +1610,10 @@ async def daily_video_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     lang = norm_lang(language_for_update(update))
+    try:
+        await context.bot.send_chat_action(update.effective_chat.id, "typing")
+    except Exception:
+        pass
     video = await pick_video(lang)
 
     await message.reply_text(
@@ -1684,6 +1708,18 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
         except Exception as e:
             logger.error("Admin message error: %s", e)
+
+
+async def track_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Guruhdagi istalgan xabarda guruhni bazaga yozib qo'yadi (bir martadan)."""
+    chat = update.effective_chat
+    if not chat or chat.type not in ("group", "supergroup"):
+        return
+
+    known = context.bot_data.setdefault("known_groups", set())
+    if chat.id not in known:
+        register_group(chat.id, chat.title or "Unknown")
+        known.add(chat.id)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -2097,8 +2133,14 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if data == "admin:video":
         await _edit(query, "⏳ Video yuborilmoqda…", html_mode=False)
         ok_count, total = await send_daily_cyber_video(context)
+        note = ""
+        if total == 0:
+            note = (
+                "\n\nℹ️ Yuboriladigan guruh yoki foydalanuvchi bazada yo‘q. "
+                "Guruhlarda biror xabar yozing yoki /protect bosing — shunda ro‘yxatga tushadi."
+            )
         await _edit(
-            query, f"🎬 Video yuborildi: {ok_count}/{total}",
+            query, f"🎬 Video yuborildi: {ok_count}/{total}{note}",
             InlineKeyboardMarkup([admin_home_button()]), html_mode=False,
         )
         return
@@ -2208,6 +2250,12 @@ def main():
             & ~filters.UpdateType.BUSINESS_MESSAGES,
             scan_message,
         )
+    )
+
+    # Guruhlarni har qanday xabardan ro'yxatga olish (boshqa handlerlarni to'xtatmaydi)
+    application.add_handler(
+        MessageHandler(filters.ChatType.GROUPS, track_group, block=False),
+        group=-2,
     )
 
     application.add_error_handler(error_handler)
