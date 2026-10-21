@@ -141,7 +141,7 @@ EXTRA = {
         "unprotect_long": "🔴 <b>APG himoyasi o‘chirildi.</b>",
         "status_on": "🟢 <b>APG faol</b>\n\n🛡️ Guruh himoyalangan.",
         "status_off": "🔴 <b>APG o‘chiq</b>\n\nHimoya vaqtincha o‘chirilgan.",
-        "video_title": "🎬 <b>KUNNING KIBERXAVFSIZLIK VIDEOSI</b>",
+        "video_title": "🎬 <b>KIBERJINOYATGA QARSHI: KUN VIDEOSI</b>",
         "video_watch": "▶️ Videoni ko‘rish",
         "admin_only_lang": "❌ Tilni faqat adminlar o‘zgartira oladi.",
         "geo_note": "ℹ️ Bu server IP manzilining taxminiy geolokatsiyasi; havolani yuborgan odamning joylashuvi emas.",
@@ -223,7 +223,7 @@ EXTRA = {
         "unprotect_long": "🔴 <b>Защита APG выключена.</b>",
         "status_on": "🟢 <b>APG активен</b>\n\n🛡️ Группа защищена.",
         "status_off": "🔴 <b>APG выключен</b>\n\nЗащита временно отключена.",
-        "video_title": "🎬 <b>ВИДЕО ДНЯ ПО КИБЕРБЕЗОПАСНОСТИ</b>",
+        "video_title": "🎬 <b>ВИДЕО ДНЯ: ПРОТИВ КИБЕРПРЕСТУПНОСТИ</b>",
         "video_watch": "▶️ Смотреть видео",
         "admin_only_lang": "❌ Язык могут менять только админы.",
         "geo_note": "ℹ️ Это примерная геолокация IP-адреса сервера, а не местоположение отправителя ссылки.",
@@ -305,7 +305,7 @@ EXTRA = {
         "unprotect_long": "🔴 <b>APG protection disabled.</b>",
         "status_on": "🟢 <b>APG is active</b>\n\n🛡️ The group is protected.",
         "status_off": "🔴 <b>APG is off</b>\n\nProtection is temporarily disabled.",
-        "video_title": "🎬 <b>CYBERSECURITY VIDEO OF THE DAY</b>",
+        "video_title": "🎬 <b>VIDEO OF THE DAY: FIGHTING CYBERCRIME</b>",
         "video_watch": "▶️ Watch video",
         "admin_only_lang": "❌ Only admins can change the language.",
         "geo_note": "ℹ️ This is an approximate geolocation of the server IP, not the location of the person who sent the link.",
@@ -1294,54 +1294,56 @@ async def scan_business_message(
 
 VIDEO_QUERIES = {
     "uz": [
-        "Kiberxavfsizlik markazi kiberxavfsizlik",
-        "kiberxavfsizlik o'zbek tilida firibgarlik",
-        "internet firibgarlik himoya o'zbekcha",
-        "phishing nima kiberxavfsizlik o'zbekcha",
+        "kiberjinoyatchilikka qarshi kurash",
+        "kiberjinoyat firibgarlik ogohlantirish",
+        "Ichki ishlar vazirligi kiberjinoyat profilaktika",
+        "plastik karta firibgarlik o'zbekcha",
+        "Kiberxavfsizlik markazi firibgarlik",
     ],
     "ru": [
-        "кибербезопасность как защититься от мошенников",
-        "фишинг как распознать",
-        "кибербезопасность для начинающих",
-        "защита аккаунтов от взлома",
+        "киберпреступность как защититься",
+        "кибермошенники как не попасться",
+        "мошенничество в интернете профилактика МВД",
+        "борьба с киберпреступлениями",
     ],
     "en": [
-        "cybersecurity awareness tips",
-        "how to spot phishing scams",
-        "online safety scams explained",
-        "cybersecurity basics for beginners",
+        "how to protect yourself from cybercrime",
+        "cybercrime prevention tips",
+        "online fraud scams awareness",
+        "fighting cybercrime explained",
     ],
 }
 
 CYBER_WORDS = {
     "uz": [
-        "kiber", "xavfsizlik", "firibgar", "himoya", "parol", "shaxsiy",
-        "ma'lumot", "ma’lumot", "zararli", "virus", "phishing", "apk",
-        "ogoh", "akkaunt", "internet",
+        "kiber", "jinoyat", "firibgar", "profilaktika", "xavfsizlik",
+        "himoya", "qarshi", "karta", "phishing", "ogoh", "virus",
+        "zararli", "akkaunt", "parol", "internet",
     ],
     "ru": [
-        "кибер", "безопасн", "фишинг", "мошенн", "взлом", "пароль",
-        "защит", "вирус", "аккаунт", "обман",
+        "киберпреступ", "преступ", "мошенн", "кибер", "фишинг", "взлом",
+        "безопасн", "защит", "обман", "профилактик", "аккаунт", "пароль",
     ],
     "en": [
-        "cyber", "phishing", "scam", "security", "password", "hack",
-        "malware", "safe", "fraud", "privacy",
+        "cybercrime", "cyber crime", "crime", "fraud", "scam", "phishing",
+        "cyber", "hack", "malware", "identity theft", "prevention",
     ],
 }
 
 UZ_MARKERS = [
-    "o'zbek", "o‘zbek", "uzbek", "xavfsizlik", "firibgar", "himoya",
-    "parol", "ma'lumot", "ma’lumot", "zararli", "ogoh",
+    "o'zbek", "o‘zbek", "uzbek", "jinoyat", "firibgar", "kiber",
+    "xavfsizlik", "himoya", "profilaktika", "ogoh", "zararli",
 ]
 
 TRUSTED_UZ_CHANNELS = [
     "kiberxavfsizlik markazi", "ichki ishlar vazirligi", "csecuz",
+    "iiv", "profilaktika",
 ]
 
 VIDEO_FALLBACK_TITLE = {
-    "uz": "Kiberxavfsizlik bo‘yicha videolar",
-    "ru": "Видео по кибербезопасности",
-    "en": "Cybersecurity videos",
+    "uz": "Kiberjinoyatlarga qarshi kurash bo‘yicha videolar",
+    "ru": "Видео о борьбе с киберпреступностью",
+    "en": "Videos on fighting cybercrime",
 }
 
 VIDEO_CACHE = {}
