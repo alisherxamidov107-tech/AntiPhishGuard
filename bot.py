@@ -62,7 +62,7 @@ if not BOT_TOKEN:
 
 DB_NAME = os.getenv("DB_PATH", "database.db")
 
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "alisher0902")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 try:
     OWNER_TELEGRAM_ID = int(os.getenv("OWNER_TELEGRAM_ID", "0"))
 except (TypeError, ValueError):
