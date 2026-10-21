@@ -862,56 +862,57 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def get_link_info(url: str):
     """
-    Domenning DNS orqali server IP manzilini aniqlaydi.
-    IP geolocation server IP bo'yicha taxminiy davlat/shahar/ISP beradi.
-    Bu linkni yuborgan odamning IP manzili emas.
-    Bloklovchi funksiya: asyncio.to_thread orqali chaqiring.
+    Domen DNS orqali server IP manzilini aniqlaydi.
+    Geo-ma'lumot server IP ga tegishli va taxminiy; linkni yuborgan odamning
+    IP manzili yoki aniq jismoniy manzili aniqlanmaydi.
     """
     try:
-        clean_url = (url or "").rstrip(".,!?;:)")
-
+        clean_url = (url or "").strip().rstrip(".,!?;:)")
+        if not clean_url:
+            return None
         if not clean_url.lower().startswith(("http://", "https://")):
             clean_url = "https://" + clean_url
 
         parsed = urlparse(clean_url)
         domain = parsed.hostname
-
         if not domain:
             return None
+        domain = domain.encode("idna").decode("ascii").lower()
 
-        domain = domain.lower()
-        ip = socket.gethostbyname(domain)
+        # DNS bir nechta IP qaytarishi mumkin; ommaviy IP tanlanadi.
+        records = socket.getaddrinfo(domain, None, type=socket.SOCK_STREAM)
+        ips = []
+        for record in records:
+            candidate = record[4][0]
+            try:
+                ip_obj = ipaddress.ip_address(candidate)
+                if ip_obj.is_global and candidate not in ips:
+                    ips.append(candidate)
+            except ValueError:
+                continue
+        if not ips:
+            return None
 
+        ip = ips[0]
         country = "?"
         city = "?"
         isp = "?"
-
         try:
             request = urllib.request.Request(
-                f"https://ipwho.is/{ip}",
+                f"https://ipwho.is/{urllib.parse.quote(ip, safe='')}",
                 headers={"User-Agent": "AntiPhishGuard/1.0"},
             )
-
             with urllib.request.urlopen(request, timeout=8) as response:
                 data = json.loads(response.read().decode("utf-8"))
-
             if data.get("success") is True:
                 connection = data.get("connection") or {}
                 country = data.get("country") or "?"
                 city = data.get("city") or "?"
                 isp = connection.get("isp") or connection.get("org") or "?"
-
         except Exception as e:
             logger.warning("IP geolocation xatosi: %s", e)
 
-        return {
-            "domain": domain,
-            "ip": ip,
-            "country": country,
-            "city": city,
-            "isp": isp,
-        }
-
+        return {"domain": domain, "ip": ip, "country": country, "city": city, "isp": isp}
     except Exception as e:
         logger.warning("Link IP aniqlash xatosi: %s", e)
         return None
@@ -939,6 +940,7 @@ async def build_link_block(url: str, lang: str, with_title: bool = False) -> str
             f"{tr(lang, 'country')}: {val(info['country'])}",
             f"{tr(lang, 'city')}: {val(info['city'])}",
             f"{tr(lang, 'isp')}: {val(info['isp'])}",
+            "ℹ️ Bu server IP manzilining taxminiy geolokatsiyasi; havolani yuborgan odamning joylashuvi emas.",
         ]
     else:
         lines.append(tr(lang, "ip_failed"))
@@ -1601,10 +1603,17 @@ async def is_bot_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
     user = update.effective_user
     return bool(
         user
-        and OWNER_TELEGRAM_ID
-        and user.id == OWNER_TELEGRAM_ID
+        and (not OWNER_TELEGRAM_ID or user.id == OWNER_TELEGRAM_ID)
         and context.user_data.get("admin_authenticated") is True
     )
+
+
+async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Foydalanuvchining Telegram raqamli ID sini ko'rsatadi."""
+    user = update.effective_user
+    message = update.effective_message
+    if user and message:
+        await message.reply_text(f"Telegram ID raqamingiz: {user.id}")
 
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1617,7 +1626,9 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat or chat.type != "private":
         await message.reply_text("❌ Admin panel faqat shaxsiy chatda ishlaydi.")
         return
-    if not OWNER_TELEGRAM_ID or user.id != OWNER_TELEGRAM_ID:
+    # OWNER_TELEGRAM_ID o'rnatilgan bo'lsa, faqat shu akkaunt kiradi.
+    # U o'rnatilmagan bo'lsa, admin panel parol bilan himoyalanadi.
+    if OWNER_TELEGRAM_ID and user.id != OWNER_TELEGRAM_ID:
         await message.reply_text("❌ Sizda admin panelga kirish huquqi yo‘q.")
         return
 
@@ -1637,7 +1648,7 @@ async def admin_password_message(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # Faqat belgilangan Telegram akkauntidan parol qabul qilinadi.
-    if not OWNER_TELEGRAM_ID or user.id != OWNER_TELEGRAM_ID:
+    if OWNER_TELEGRAM_ID and user.id != OWNER_TELEGRAM_ID:
         context.user_data.pop("admin_waiting_password", None)
         return
 
@@ -1760,7 +1771,7 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             _, _, raw_chat_id, raw_enabled, raw_page = data.split(":")
             chat_id, old_enabled, page = int(raw_chat_id), int(raw_enabled), int(raw_page)
         except (ValueError, TypeError):
-            await query.answer("Noto‘g‘ri amal.", show_alert=True)
+            await query.edit_message_text("❌ Amal ma'lumotlari noto‘g‘ri.")
             return
         set_protection(chat_id, not bool(old_enabled))
         await query.edit_message_text(
@@ -1845,6 +1856,7 @@ def main():
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("video", daily_video_command))
     application.add_handler(CommandHandler("language", language_command))
+    application.add_handler(CommandHandler("myid", myid_command))
 
     # Inline tugmalar (til handleri OLDIN turishi shart)
     application.add_handler(
